@@ -132,7 +132,10 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
         ("lib/shop/types.rb", "module Shop\n  module Types\n    include Dry.Types()\n  end\nend\n"),
         ("lib/shop/base.rb", "module Shop\n  class Base < Dry::Struct\n  end\nend\n"),
         ("lib/shop/good.rb", "module Shop\n  class Good < Base\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
-        ("lib/shop/bad.rb", "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Params::Decimal\n  end\nend\n"),
+        (
+            "lib/shop/bad.rb",
+            "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Params::Decimal\n    attribute :inner do\n      attribute :n, ::Shop::Types::Coercible::Integer\n    end\n  end\nend\n",
+        ),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ]
     .into_iter()
@@ -145,6 +148,10 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
     assert!(class("Shop::Good").methods.iter().all(|m| m.name.as_str() != "id"), "sibling lowered");
     assert!(class("Shop::Good").unknown_calls.iter().any(|c| roundhouse::emit::ruby::emit_expr(c).starts_with("attribute")));
     assert!(app.library_classes.iter().all(|lc| lc.name.0.as_str() != "Dry::Struct"), "stand-in added");
+    // The nested struct goes with its refused owner, which names it as a
+    // type on the gem.
+    assert_eq!(class("Shop::Bad::Inner").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
+    assert!(class("Shop::Bad::Inner").methods.iter().all(|m| m.name.as_str() != "n"), "nested lowered");
 }
 
 /// The harness itself: the unedited blog emits and its controller

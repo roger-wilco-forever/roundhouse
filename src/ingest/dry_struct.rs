@@ -125,12 +125,14 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
     if parent_of.is_empty() {
         return;
     }
-    expand_nested(app, &mut parent_of, &types_modules);
+    let nested_owner = expand_nested(app, &mut parent_of, &types_modules);
     let names: HashSet<String> =
         app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
 
-    // Read every struct's declarations.
+    // Read every struct's declarations and build its methods; a class
+    // either part fails is refused here, before any hierarchy is lowered.
     let mut read: HashMap<String, StructClass> = HashMap::new();
+    let mut built: HashMap<String, Vec<crate::dialect::MethodDef>> = HashMap::new();
     let mut refused: HashSet<String> = HashSet::new();
     for lc in &app.library_classes {
         let name = lc.name.0.as_str();
@@ -138,24 +140,43 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
             continue;
         }
         let scope = Scope { types_modules: &types_modules, owner: name, names: &names, structs: &parent_of };
-        match read_struct(lc, &scope) {
-            Ok(s) => {
-                read.insert(name.to_string(), s);
-            }
+        let s = match read_struct(lc, &scope) {
+            Ok(s) => s,
             Err(reason) => {
                 survey::record(&IngestError::Unsupported {
                     file: name.to_string(),
                     message: format!("Dry::Struct not lowered: {reason}"),
                 });
                 refused.insert(name.to_string());
+                continue;
+            }
+        };
+        let source = synthesized_source(name, &s, parent_of[name].is_none());
+        let (parsed, diags) = crate::ingest::prism::scope(|| {
+            crate::ingest::ingest_library_classes(source.as_bytes(), "<dry_struct>")
+        });
+        match parsed {
+            Ok(classes) if diags.is_empty() => {
+                built.insert(name.to_string(), classes.into_iter().flat_map(|c| c.methods).collect());
+            }
+            Ok(_) => {
+                survey::record_synthesis_failure(name.to_string(), "Dry::Struct lowering", &diags);
+                refused.insert(name.to_string());
+            }
+            Err(err) => {
+                survey::record(&err);
+                refused.insert(name.to_string());
             }
         }
+        read.insert(name.to_string(), s);
     }
     // All or nothing per hierarchy. Lowering a root makes it an ordinary
     // known class, so a refused descendant would no longer reach the
     // unknown `Dry::Struct` and its attribute calls would read as
     // missing methods rather than as the gap they are. A struct that
-    // builds another struct needs that one's hierarchy lowered too.
+    // builds another struct needs that one's hierarchy lowered too, and
+    // a nested struct goes with its owner: an owner kept on the gem names
+    // it as a type, which it must then still be.
     let root_of = |name: &str| -> String {
         let mut cur = name.to_string();
         while let Some(Some(parent)) = parent_of.get(&cur) {
@@ -171,6 +192,11 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
                 refused_roots.insert(root_of(name));
             }
         }
+        for (nested, owner) in &nested_owner {
+            if refused_roots.contains(&root_of(owner)) {
+                refused_roots.insert(root_of(nested));
+            }
+        }
         if refused_roots.len() == before {
             break;
         }
@@ -183,27 +209,8 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         if !parent_of.contains_key(&name) || !lowered(&name) {
             continue;
         }
-        let s = &read[&name];
-        let is_root = parent_of[&name].is_none();
-        let source = synthesized_source(&name, s, is_root);
-        let (parsed, diags) = crate::ingest::prism::scope(|| {
-            crate::ingest::ingest_library_classes(source.as_bytes(), "<dry_struct>")
-        });
-        let methods = match parsed {
-            Ok(classes) if diags.is_empty() => {
-                classes.into_iter().flat_map(|c| c.methods).collect::<Vec<_>>()
-            }
-            Ok(_) => {
-                survey::record_synthesis_failure(name.clone(), "Dry::Struct lowering", &diags);
-                continue;
-            }
-            Err(err) => {
-                survey::record(&err);
-                continue;
-            }
-        };
+        let Some(mut methods) = built.remove(&name) else { continue };
         lc.unknown_calls.retain(|call| !is_struct_declaration(call));
-        let mut methods = methods;
         methods.append(&mut lc.methods);
         lc.methods = methods;
         // The parent by the name it resolved to, not as written: `Base`
@@ -255,7 +262,12 @@ fn struct_parents(classes: &[LibraryClass]) -> HashMap<String, Option<String>> {
 /// (`attribute :items, Types::Array do` defines `Owner::Item`) and the
 /// attribute is an Array of it. Each nested class is a struct like any
 /// other, so its own blocks nest the same way.
-fn expand_nested(app: &mut App, parent_of: &mut HashMap<String, Option<String>>, types_modules: &[String]) {
+fn expand_nested(
+    app: &mut App,
+    parent_of: &mut HashMap<String, Option<String>>,
+    types_modules: &[String],
+) -> HashMap<String, String> {
+    let mut owner_of: HashMap<String, String> = HashMap::new();
     let mut queue: Vec<String> = parent_of.keys().cloned().collect();
     queue.sort();
     while let Some(owner) = queue.pop() {
@@ -341,10 +353,12 @@ fn expand_nested(app: &mut App, parent_of: &mut HashMap<String, Option<String>>,
         for c in created {
             let name = c.name.0.as_str().to_string();
             parent_of.insert(name.clone(), None);
+            owner_of.insert(name.clone(), owner.clone());
             queue.push(name);
             app.library_classes.push(c);
         }
     }
+    owner_of
 }
 
 /// The `transform_keys` call that applies to `name`: its own, or its
