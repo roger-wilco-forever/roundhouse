@@ -17,16 +17,23 @@
 //! not fit. A subclass's own attributes come after its parent's, as the
 //! schema inherits.
 //!
-//! The subset is what dry-types means by the names applications use most:
-//! `Coercible::`, `Strict::`, `Params::Integer`/`Bool` and nominal
-//! scalars, `Array.of(...)`, `Hash.schema(...)`, `Instance(X)`, another
-//! struct class, `.optional`, `.enum(...)`, `.meta(...)`, and a
-//! `.default` that is a literal, a constant, or a block that reads no
-//! `self`. A nested `attribute ... do` becomes the `Owner::Name` struct
-//! dry-struct defines. A class with anything else is left as it was and
-//! ledgered, and so is every class that shares its `Dry::Struct` root or
-//! builds one that does: a struct is all its attributes or none, and a
-//! hierarchy all its structs or none.
+//! Types mean what dry-types makes them, checked against the gem: a bare
+//! name is strict under `Dry.Types()`; `Coercible::`, `Strict::`,
+//! `Params::` and `JSON::` scalars, dates and decimals; `Array.of`,
+//! `Hash.schema`, `Instance(X)`, another struct class, `A | B`,
+//! `Constructor(K) { }` and `.constructor { }`, `.optional`, `.enum`,
+//! `.meta`, and `.default` (a value shared from where it is written, or
+//! a block called each time); a constant holding any of these. A nested
+//! `attribute ... do` becomes the `Owner::Name` struct dry-struct defines,
+//! `attributes_from` inlines another struct's attributes, and
+//! `attribute :name?` is `attribute? :name`.
+//!
+//! A class with anything else (`transform_types`, an app's own
+//! `attribute` override) is left as it was and ledgered, and so is every
+//! class that shares its `Dry::Struct` root or builds one that does: a
+//! struct is all its attributes or none, and a hierarchy all its structs
+//! or none. The date and decimal coercions need stdlib only the CRuby and
+//! JRuby trees load; `project` reports them for any other target.
 
 use std::collections::{HashMap, HashSet};
 
@@ -62,6 +69,24 @@ enum Base {
     /// `Hash.schema(k: T, o?: T)`: a Hash of just those keys, each
     /// through its type; `o?` may be absent and is then left out.
     HashSchema(Vec<(String, bool, DryType)>),
+    /// `A | B`: the first that accepts the value.
+    Sum(Vec<DryType>),
+    /// `Types.Constructor(K) { |v| ... }`, `T.constructor { |v| ... }`:
+    /// the block's value, then through `then`.
+    Constructor { param: Symbol, body: Expr, then: Box<DryType> },
+    /// `Params::`/`JSON::` `Date`, `DateTime`, `Time`: a String parsed,
+    /// an instance passed through.
+    Parse(&'static str),
+    /// `Params::Decimal`: a value `Float()` accepts, as `to_d` makes it.
+    ParamsDecimal,
+}
+
+/// A `.default`: a value dry-types evaluates once, where the type is
+/// written, and hands out every time; or a block it calls each time.
+#[derive(Clone, Debug)]
+enum DefaultValue {
+    Value(Expr),
+    Block(Expr),
 }
 
 impl DryType {
@@ -71,6 +96,8 @@ impl DryType {
             Base::Struct(name) => out.push(name.clone()),
             Base::ArrayOf { member, .. } => member.structs(out),
             Base::HashSchema(keys) => keys.iter().for_each(|(_, _, t)| t.structs(out)),
+            Base::Sum(types) => types.iter().for_each(|t| t.structs(out)),
+            Base::Constructor { then, .. } => then.structs(out),
             _ => {}
         }
     }
@@ -83,13 +110,17 @@ struct Scope<'a> {
     owner: &'a str,
     names: &'a HashSet<String>,
     structs: &'a HashMap<String, Option<String>>,
+    /// Every class-body constant, by full name, with its value.
+    constants: &'a HashMap<String, Expr>,
+    /// Constants followed so far, against a cycle.
+    depth: usize,
 }
 
 #[derive(Clone, Debug)]
 struct DryType {
     base: Base,
     optional: bool,
-    default: Option<Expr>,
+    default: Option<DefaultValue>,
     /// `.enum(...)`: the values the coerced value must be one of.
     enumeration: Option<Vec<Expr>>,
     /// `.meta(omittable: true)`: in a `Hash.schema`, the key may be absent.
@@ -126,13 +157,24 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         return;
     }
     let nested_owner = expand_nested(app, &mut parent_of, &types_modules);
-    let names: HashSet<String> =
+    inline_attributes_from(app, &parent_of);
+    let mut names: HashSet<String> =
         app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
+    let constants: HashMap<String, Expr> = app
+        .library_classes
+        .iter()
+        .flat_map(|lc| {
+            lc.constants
+                .iter()
+                .map(move |(n, v)| (format!("{}::{}", lc.name.0.as_str(), n.as_str()), v.clone()))
+        })
+        .collect();
+    names.extend(constants.keys().cloned());
 
     // Read every struct's declarations and build its methods; a class
     // either part fails is refused here, before any hierarchy is lowered.
     let mut read: HashMap<String, StructClass> = HashMap::new();
-    let mut built: HashMap<String, Vec<crate::dialect::MethodDef>> = HashMap::new();
+    let mut built: HashMap<String, (Vec<crate::dialect::MethodDef>, Vec<(Symbol, Expr)>)> = HashMap::new();
     let mut refused: HashSet<String> = HashSet::new();
     // What each refused class names as a struct type.
     let mut refused_names: Vec<String> = Vec::new();
@@ -141,7 +183,14 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         if !parent_of.contains_key(name) {
             continue;
         }
-        let scope = Scope { types_modules: &types_modules, owner: name, names: &names, structs: &parent_of };
+        let scope = Scope {
+            types_modules: &types_modules,
+            owner: name,
+            names: &names,
+            structs: &parent_of,
+            constants: &constants,
+            depth: 0,
+        };
         let s = match read_struct(lc, &scope) {
             Ok(s) => s,
             Err(reason) => {
@@ -160,7 +209,13 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         });
         match parsed {
             Ok(classes) if diags.is_empty() => {
-                built.insert(name.to_string(), classes.into_iter().flat_map(|c| c.methods).collect());
+                let mut methods = Vec::new();
+                let mut generated = Vec::new();
+                for c in classes {
+                    methods.extend(c.methods);
+                    generated.extend(c.constants);
+                }
+                built.insert(name.to_string(), (methods, generated));
             }
             Ok(_) => {
                 survey::record_synthesis_failure(name.to_string(), "Dry::Struct lowering", &diags);
@@ -213,8 +268,13 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         if !parent_of.contains_key(&name) || !lowered(&name) {
             continue;
         }
-        let Some(mut methods) = built.remove(&name) else { continue };
+        let Some((mut methods, generated)) = built.remove(&name) else { continue };
         lc.unknown_calls.retain(|call| !is_struct_declaration(call));
+        // A constant holding a dry type was read where an attribute names
+        // it; left in place it would build that type when the class loads.
+        lc.constants.retain(|(_, value)| !holds_dry_type(value, &types_modules));
+        lc.constants.extend(generated);
+        lc.origin = Some(crate::dialect::LibraryClassOrigin::DryStruct);
         methods.append(&mut lc.methods);
         lc.methods = methods;
         // The parent by the name it resolved to, not as written: `Base`
@@ -228,6 +288,11 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
     // and its attribute calls would read as missing; the gem keeps it.
     if any && refused_roots.is_empty() {
         app.library_classes.extend(error_classes());
+        // Nothing left needs dry-types, and the `Types` modules are not
+        // emitted: a constant still building a type would fail the load.
+        for lc in &mut app.library_classes {
+            lc.constants.retain(|(_, value)| !holds_dry_type(value, &types_modules));
+        }
     }
 }
 
@@ -366,6 +431,68 @@ fn expand_nested(
     owner_of
 }
 
+/// `attributes_from X` declares `X`'s attributes, inherited ones first,
+/// in its place. Inlined when every constant they name is spelled from
+/// the top (`::...`), so it reads the same from the new class; otherwise
+/// it stays, and the class is refused for it.
+fn inline_attributes_from(app: &mut App, parent_of: &HashMap<String, Option<String>>) {
+    let names: HashSet<String> = app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
+    let calls_of = |name: &str| -> Option<Vec<Expr>> {
+        let mut chain = Vec::new();
+        let mut cur = Some(name.to_string());
+        while let Some(n) = cur {
+            chain.push(n.clone());
+            cur = parent_of.get(&n).cloned().flatten();
+        }
+        let mut out = Vec::new();
+        for n in chain.iter().rev() {
+            let lc = app.library_classes.iter().find(|lc| lc.name.0.as_str() == n)?;
+            for call in &lc.unknown_calls {
+                let ExprNode::Send { recv: None, method, .. } = &*call.node else { continue };
+                if matches!(method.as_str(), "attribute" | "attribute?") {
+                    out.push(call.clone());
+                }
+            }
+        }
+        out.iter().all(absolute_constants).then_some(out)
+    };
+    let mut rewrites: Vec<(usize, usize, Vec<Expr>)> = Vec::new();
+    for (ci, lc) in app.library_classes.iter().enumerate() {
+        let owner = lc.name.0.as_str();
+        if !parent_of.contains_key(owner) {
+            continue;
+        }
+        for (ui, call) in lc.unknown_calls.iter().enumerate() {
+            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { continue };
+            if method.as_str() != "attributes_from" {
+                continue;
+            }
+            let [ExprNode::Const { path }] = args.iter().map(|a| &*a.node).collect::<Vec<_>>()[..] else { continue };
+            let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+            let Some(source) = resolve_in(owner, &written, &names).filter(|n| parent_of.contains_key(n)) else {
+                continue;
+            };
+            if let Some(calls) = calls_of(&source) {
+                rewrites.push((ci, ui, calls));
+            }
+        }
+    }
+    for (ci, ui, calls) in rewrites.into_iter().rev() {
+        app.library_classes[ci].unknown_calls.splice(ui..=ui, calls);
+    }
+}
+
+/// Every constant in `expr` is spelled from the top level.
+fn absolute_constants(expr: &Expr) -> bool {
+    let own = match &*expr.node {
+        ExprNode::Const { path } => path.first().is_some_and(|s| s.as_str().is_empty()),
+        _ => true,
+    };
+    let mut ok = own;
+    expr.node.for_each_child(&mut |c| ok &= absolute_constants(c));
+    ok
+}
+
 /// The `transform_keys` call that applies to `name`: its own, or its
 /// nearest struct ancestor's.
 fn effective_transform(
@@ -458,6 +585,13 @@ fn types_modules(sources: &[crate::span::SourceFile]) -> Vec<(String, BareNames)
     finder.found
 }
 
+/// `name` as Ruby resolves it in `owner`'s body: `owner` itself first,
+/// then outward.
+fn resolve_in(owner: &str, name: &str, names: &HashSet<String>) -> Option<String> {
+    let own = format!("{owner}::{name}");
+    if names.contains(&own) { Some(own) } else { resolve(owner, name, names) }
+}
+
 /// `parent` as Ruby resolves it from inside `owner`: the innermost
 /// enclosing namespace that defines it, then the top level.
 fn resolve(owner: &str, parent: &str, names: &HashSet<String>) -> Option<String> {
@@ -502,7 +636,7 @@ fn named_structs(lc: &LibraryClass, scope: &Scope<'_>) -> Vec<String> {
             let full = if written.first() == Some(&"") {
                 scope.names.contains(&name).then_some(name)
             } else {
-                resolve(scope.owner, &name, scope.names)
+                resolve_in(scope.owner, &name, scope.names)
             };
             if let Some(full) = full.filter(|f| scope.structs.contains_key(f)) {
                 out.push(full);
@@ -548,7 +682,13 @@ fn read_struct(lc: &LibraryClass, scope: &Scope<'_>) -> Result<StructClass, Stri
                 let ty = dry_type(ty, scope).ok_or_else(|| {
                     format!("attribute `{}` type `{}`", name.as_str(), crate::emit::ruby::emit_expr(ty))
                 })?;
-                attributes.push(Attribute { name: name.clone(), omittable: method.as_str() == "attribute?", ty });
+                // `attribute :name?` is dry-struct's other spelling of
+                // `attribute? :name`.
+                let (name, suffixed) = match name.as_str().strip_suffix('?') {
+                    Some(bare) => (Symbol::from(bare), true),
+                    None => (name.clone(), false),
+                };
+                attributes.push(Attribute { name, omittable: suffixed || method.as_str() == "attribute?", ty });
             }
             // The rest of dry-struct's class DSL changes the schema or the
             // constructor; dropping it would lower a different struct.
@@ -567,21 +707,24 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
     match &*expr.node {
         ExprNode::Const { path } => {
             let Some(rest) = types_path(path, scope.types_modules) else {
-                // Another struct class, as Ruby resolves the constant here.
+                // Another struct class, or a constant holding a type, as
+                // Ruby resolves the name here.
                 let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>();
                 let name = written.iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("::");
                 let full = if written.first() == Some(&"") {
                     scope.names.contains(&name).then_some(name)
                 } else {
-                    resolve(scope.owner, &name, scope.names)
+                    resolve_in(scope.owner, &name, scope.names)
                 }?;
-                return scope.structs.contains_key(&full).then(|| DryType {
-                    base: Base::Struct(full),
-                    optional: false,
-                    default: None,
-                    enumeration: None,
-                    omittable: false,
-                });
+                if scope.structs.contains_key(&full) {
+                    return plain(Base::Struct(full));
+                }
+                let value = scope.constants.get(&full)?;
+                if scope.depth > 8 {
+                    return None;
+                }
+                let holder = full.rsplit_once("::").map_or("", |(h, _)| h);
+                return dry_type(value, &Scope { owner: holder, depth: scope.depth + 1, ..*scope });
             };
             let base = match rest.as_slice() {
                 ["Coercible", "String"] => Base::Coerce("String"),
@@ -591,6 +734,13 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 ["Coercible", "Symbol"] => Base::CoerceSymbol,
                 ["Params", "Integer"] => Base::ParamsInteger,
                 ["Params", "Bool"] => Base::ParamsBool,
+                ["Params", "Decimal"] => Base::ParamsDecimal,
+                ["Coercible", "Decimal"] => Base::Coerce("BigDecimal"),
+                ["JSON", "Hash"] => Base::Strict("Hash"),
+                ["JSON", "Array"] => Base::Strict("Array"),
+                ["Params" | "JSON", "Date"] => Base::Parse("Date"),
+                ["Params" | "JSON", "DateTime"] => Base::Parse("DateTime"),
+                ["Params" | "JSON", "Time"] => Base::Parse("Time"),
                 ["Strict", t @ ("String" | "Integer" | "Float" | "Hash" | "Array" | "Symbol")] => {
                     Base::Strict(match *t {
                         "String" => "String",
@@ -611,7 +761,17 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 {
                     Base::Nominal
                 }
-                _ => return None,
+                // A constant of the app's own in a `Types` module.
+                _ => {
+                    let name = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                    let full = resolve_in(scope.owner, &name, scope.names)?;
+                    let value = scope.constants.get(&full)?;
+                    if scope.depth > 8 {
+                        return None;
+                    }
+                    let holder = full.rsplit_once("::").map_or("", |(h, _)| h);
+                    return dry_type(value, &Scope { owner: holder, depth: scope.depth + 1, ..*scope });
+                }
             };
             plain(base)
         }
@@ -627,8 +787,33 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 return None;
             }
             let mut ty = dry_type(recv, scope)?;
-            ty.default = Some(body.clone());
+            ty.default = Some(DefaultValue::Block(body.clone()));
             Some(ty)
+        }
+        // `Types.Constructor(K) { |v| ... }`, `T.constructor { |v| ... }`.
+        // The block runs as a class method of the struct, so only one that
+        // reads no `self`.
+        ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. }
+            if matches!(method.as_str(), "Constructor" | "constructor") =>
+        {
+            let ExprNode::Lambda { params, body, .. } = &*block.node else { return None };
+            let [param] = params.as_slice() else { return None };
+            if reads_self(body) {
+                return None;
+            }
+            let then = if method.as_str() == "Constructor" {
+                let ExprNode::Const { path } = &*recv.node else { return None };
+                if !types_path(path, scope.types_modules)?.is_empty() || args.len() != 1 {
+                    return None;
+                }
+                DryType { base: Base::Nominal, optional: false, default: None, enumeration: None, omittable: false }
+            } else {
+                if !args.is_empty() {
+                    return None;
+                }
+                dry_type(recv, scope)?
+            };
+            plain(Base::Constructor { param: param.clone(), body: next_to_return(body), then: Box::new(then) })
         }
         ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => match method.as_str() {
             "optional" if args.is_empty() => {
@@ -636,14 +821,32 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 ty.optional = true;
                 Some(ty)
             }
+            // Evaluated once where written, as dry-types does; `shared:`
+            // only silences its warning about exactly that.
             "default" => {
-                let [value] = args.as_slice() else { return None };
-                if !literal(value) {
-                    return None;
-                }
+                let value = match args.as_slice() {
+                    [value] => value,
+                    [value, options] if shared_option(options) => value,
+                    _ => return None,
+                };
                 let mut ty = dry_type(recv, scope)?;
-                ty.default = Some(value.clone());
+                ty.default = Some(DefaultValue::Value(value.clone()));
                 Some(ty)
+            }
+            "|" => {
+                let [right] = args.as_slice() else { return None };
+                let mut members = Vec::new();
+                for side in [recv, right] {
+                    let ty = dry_type(side, scope)?;
+                    if ty.default.is_some() {
+                        return None;
+                    }
+                    match ty.base {
+                        Base::Sum(inner) if !ty.optional && ty.enumeration.is_none() => members.extend(inner),
+                        _ => members.push(ty),
+                    }
+                }
+                plain(Base::Sum(members))
             }
             // Metadata, but `omittable: true` makes a schema key optional.
             "meta" => {
@@ -746,13 +949,52 @@ fn types_path<'a>(path: &'a [Symbol], types_modules: &[(String, BareNames)]) -> 
     })
 }
 
+/// A block body as a method body: its own `next` becomes `return`. A
+/// `next` in a block nested inside it belongs to that block and stays.
+fn next_to_return(expr: &Expr) -> Expr {
+    fn walk(expr: &mut Expr) {
+        if matches!(&*expr.node, ExprNode::Lambda { .. }) {
+            return;
+        }
+        if let ExprNode::Next { value } = &*expr.node {
+            let value = value
+                .clone()
+                .unwrap_or_else(|| Expr::new(expr.span, ExprNode::Lit { value: Literal::Nil }));
+            *expr.node = ExprNode::Return { value };
+        }
+        expr.node.for_each_child_mut(&mut |c| walk(c));
+    }
+    let mut body = expr.clone();
+    walk(&mut body);
+    body
+}
+
+/// Whether `expr` builds a dry type: it reads a `Types` module.
+fn holds_dry_type(expr: &Expr, types_modules: &[(String, BareNames)]) -> bool {
+    let own = matches!(&*expr.node, ExprNode::Const { path } if types_path(path, types_modules).is_some());
+    let mut found = own;
+    expr.node.for_each_child(&mut |c| found |= holds_dry_type(c, types_modules));
+    found
+}
+
+/// `shared: true`, the only `.default` option.
+fn shared_option(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Hash { entries, .. } if entries.len() == 1 && entries.iter().all(|(k, v)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "shared")
+            && matches!(&*v.node, ExprNode::Lit { value: Literal::Bool { .. } })
+    }))
+}
+
 /// Whether `expr` reads the receiver it runs on: a bare call, an ivar,
-/// `self`.
+/// `self`. Kernel's conversion functions are bare calls that read none.
 fn reads_self(expr: &Expr) -> bool {
-    let own = matches!(
-        &*expr.node,
-        ExprNode::Send { recv: None, .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef
-    );
+    let own = match &*expr.node {
+        ExprNode::Send { recv: None, method, .. } => {
+            !matches!(method.as_str(), "Array" | "Integer" | "Float" | "String" | "Hash" | "BigDecimal")
+        }
+        ExprNode::Ivar { .. } | ExprNode::SelfRef => true,
+        _ => false,
+    };
     let mut found = own;
     expr.node.for_each_child(&mut |c| found |= reads_self(c));
     found
@@ -774,8 +1016,34 @@ fn literal(expr: &Expr) -> bool {
     }
 }
 
+/// What the generated class carries besides its constructor: a constant
+/// per shared default, a class method per constructor block.
+#[derive(Default)]
+struct Gen {
+    constants: Vec<String>,
+    helpers: Vec<String>,
+}
+
+impl Gen {
+    /// The expression a missing key takes: the shared value, through a
+    /// constant unless it already is one, or the block's body.
+    fn missing_value(&mut self, default: &DefaultValue) -> String {
+        match default {
+            DefaultValue::Value(value) if matches!(&*value.node, ExprNode::Const { .. }) => {
+                crate::emit::ruby::emit_expr(value)
+            }
+            DefaultValue::Value(value) => {
+                let name = format!("DRY_STRUCT_DEFAULT_{}", self.constants.len());
+                self.constants.push(format!("{name} = {}", crate::emit::ruby::emit_expr(value)));
+                name
+            }
+            DefaultValue::Block(body) => format!("(begin\n{}\nend)", crate::emit::ruby::emit_expr(body)),
+        }
+    }
+}
+
 /// `value` coerced or checked as `ty` says, raising `Dry::Struct::Error`.
-fn coerced(ty: &DryType, value: &str, key: &str) -> String {
+fn coerced(extra: &mut Gen, ty: &DryType, value: &str, key: &str) -> String {
     let fail = format!("raise(Dry::Struct::Error, \"[#{{self.class}}.new] {key} has an invalid value\")");
     let inner = match &ty.base {
         Base::Coerce(kernel) => {
@@ -788,11 +1056,16 @@ fn coerced(ty: &DryType, value: &str, key: &str) -> String {
             let mut optional = String::new();
             for (k, omittable, t) in keys {
                 let read = format!("{value}[:{k}]");
-                let each = coerced(t, &read, &format!(":{k}"));
-                if *omittable {
-                    optional.push_str(&format!(".merge({value}.key?(:{k}) ? {{ {k}: {each} }} : {{}})"));
-                } else {
-                    required.push(format!("{k}: ({value}.key?(:{k}) ? {each} : {fail})"));
+                let each = coerced(extra, t, &read, &format!(":{k}"));
+                match (&t.default, omittable) {
+                    (Some(default), _) => {
+                        let missing = extra.missing_value(default);
+                        required.push(format!("{k}: ({value}.key?(:{k}) ? {each} : {missing})"));
+                    }
+                    (None, true) => {
+                        optional.push_str(&format!(".merge({value}.key?(:{k}) ? {{ {k}: {each} }} : {{}})"));
+                    }
+                    (None, false) => required.push(format!("{k}: ({value}.key?(:{k}) ? {each} : {fail})")),
                 }
             }
             format!("({value}.is_a?(Hash) ? {{ {} }}{optional} : {fail})", required.join(", "))
@@ -803,6 +1076,13 @@ fn coerced(ty: &DryType, value: &str, key: &str) -> String {
         Base::ParamsBool => format!(
             "(%w[1 on On ON t true True TRUE T y yes Yes YES Y].include?({value}.to_s) ? true : (%w[0 off Off OFF f false False FALSE F n no No NO N].include?({value}.to_s) ? false : {fail}))"
         ),
+        // `to_d` as bigdecimal/util defines it, which the tree does not load.
+        Base::ParamsDecimal => format!(
+            "(begin\n  Float({value})\n  case {value}\n  when Float then BigDecimal({value}, 0)\n  when String then BigDecimal.interpret_loosely({value})\n  when BigDecimal then {value}\n  else BigDecimal({value})\n  end\nrescue ArgumentError, TypeError\n  {fail}\nend)"
+        ),
+        Base::Parse(class) => format!(
+            "({value}.respond_to?(:to_str) ? (begin\n  ::{class}.parse({value})\nrescue ArgumentError, RangeError\n  {fail}\nend) : ({value}.is_a?(::{class}) ? {value} : {fail}))"
+        ),
         Base::CoerceSymbol => {
             format!("(begin\n  {value}.to_sym\nrescue NoMethodError\n  {fail}\nend)")
         }
@@ -812,13 +1092,34 @@ fn coerced(ty: &DryType, value: &str, key: &str) -> String {
         ),
         Base::Nominal => value.to_string(),
         Base::ArrayOf { strict, member } => {
-            let each = coerced(member, "member", key);
+            let each = coerced(extra, member, "member", key);
             let mapped = format!("{value}.map {{ |member| {each} }}");
             if *strict {
                 format!("({value}.is_a?(Array) ? {mapped} : {fail})")
             } else {
                 mapped
             }
+        }
+        // Each alternative in turn; a refusal moves on to the next.
+        Base::Sum(types) => {
+            let mut alternatives = types.iter().map(|t| coerced(extra, t, value, key)).collect::<Vec<_>>();
+            let last = alternatives.pop().unwrap_or_else(|| fail.clone());
+            alternatives.into_iter().rev().fold(last, |rest, first| {
+                format!("(begin\n  {first}\nrescue Dry::Struct::Error\n  {rest}\nend)")
+            })
+        }
+        // A class method holding the block, its value then checked.
+        Base::Constructor { param, body, then } => {
+            let slot = extra.helpers.len();
+            let name = format!("dry_struct_constructor_{slot}");
+            extra.helpers.push(String::new());
+            let checked = coerced(extra, then, "dry_struct_value", key);
+            extra.helpers[slot] = format!(
+                "  def self.{name}({param})\n    dry_struct_value = (begin\n{}\nend)\n    {checked}\n  end\n",
+                crate::emit::ruby::emit_expr(body),
+                param = param.as_str(),
+            );
+            format!("self.class.{name}({value})")
         }
     };
     let inner = match &ty.enumeration {
@@ -836,11 +1137,10 @@ fn coerced(ty: &DryType, value: &str, key: &str) -> String {
 }
 
 fn synthesized_source(owner: &str, s: &StructClass, is_root: bool) -> String {
-    let mut out = String::new();
-    let name = owner.rsplit("::").next().unwrap_or(owner);
-    out.push_str(&format!("class {name}\n"));
+    let mut extra = Gen::default();
+    let mut body = String::new();
     if is_root || s.transform_keys.is_some() {
-        let body = match &s.transform_keys {
+        let keys = match &s.transform_keys {
             // The declared call, sent to the attributes Hash instead.
             Some(call) => {
                 let mut call = call.clone();
@@ -854,35 +1154,51 @@ fn synthesized_source(owner: &str, s: &StructClass, is_root: bool) -> String {
             }
             None => "attributes".to_string(),
         };
-        out.push_str(&format!("  def self.dry_struct_keys(attributes)\n    {body}\n  end\n\n"));
+        body.push_str(&format!("  def self.dry_struct_keys(attributes)\n    {keys}\n  end\n\n"));
     }
     if is_root {
-        out.push_str(
+        body.push_str(
             "  def initialize(attributes = {})\n    dry_struct_assign(self.class.dry_struct_keys(attributes))\n  end\n\n",
         );
     }
     for a in &s.attributes {
-        out.push_str(&format!("  def {0}\n    @{0}\n  end\n\n", a.name.as_str()));
+        body.push_str(&format!("  def {0}\n    @{0}\n  end\n\n", a.name.as_str()));
     }
-    out.push_str("  private\n\n  def dry_struct_assign(attributes)\n");
+    let mut assign_body = String::new();
     if !is_root {
-        out.push_str("    super(attributes)\n");
+        assign_body.push_str("    super(attributes)\n");
     }
     for a in &s.attributes {
         let key = a.name.as_str();
         let value = format!("attributes[:{key}]");
-        let assign = coerced(&a.ty, &value, &format!(":{key}"));
+        let assign = coerced(&mut extra, &a.ty, &value, &format!(":{key}"));
         let missing = match (&a.ty.default, a.omittable) {
-            (Some(default), _) => crate::emit::ruby::emit_expr(default),
+            (Some(default), _) => extra.missing_value(default),
             (None, true) => "nil".to_string(),
             (None, false) => format!(
                 "raise(Dry::Struct::Error, \"[#{{self.class}}.new] :{key} is missing in Hash input\")"
             ),
         };
-        out.push_str(&format!(
+        assign_body.push_str(&format!(
             "    @{key} = if attributes.key?(:{key})\n      {assign}\n    else\n      {missing}\n    end\n"
         ));
     }
+    let mut out = String::new();
+    let name = owner.rsplit("::").next().unwrap_or(owner);
+    out.push_str(&format!("class {name}\n"));
+    for constant in &extra.constants {
+        out.push_str(&format!("  {constant}\n"));
+    }
+    if !extra.constants.is_empty() {
+        out.push('\n');
+    }
+    for helper in &extra.helpers {
+        out.push_str(helper);
+        out.push('\n');
+    }
+    out.push_str(&body);
+    out.push_str("  private\n\n  def dry_struct_assign(attributes)\n");
+    out.push_str(&assign_body);
     out.push_str("    self\n  end\nend\n");
     out
 }

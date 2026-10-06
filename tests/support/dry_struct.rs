@@ -5,7 +5,7 @@ pub fn overlay() -> super::emit_and_run::Overlay {
     super::emit_and_run::real_blog()
         .write(
             "lib/shop/types.rb",
-            "module Shop\n  module Types\n    include Dry.Types()\n  end\nend\n",
+            "module Shop\n  module Types\n    include Dry.Types()\n\n    Loud = Types.Constructor(String) do |value|\n      next \"none\" if value.nil?\n\n      value.to_s.upcase\n    end\n  end\nend\n",
         )
         .write(
             "lib/shop/base_response.rb",
@@ -40,6 +40,10 @@ end
             "lib/shop/order.rb",
             r#"module Shop
   class Order < BaseResponse
+    CURRENCY = "RUB"
+    CODE = ::Shop::Types::Coercible::String
+    Upcased = ::Shop::Types.Constructor(String) { |value| value.to_s.upcase }
+
     attribute :amount do
       attribute :value, ::Shop::Types::Coercible::String
     end
@@ -69,11 +73,29 @@ end
     attribute? :codes, ::Shop::Types::Array.of(::Shop::Types::String)
     attribute? :anything, ::Shop::Types::Any
     attribute? :loose, ::Shop::Types::Nominal::String
+    attribute? :shared, ::Shop::Types::Array.default([], shared: true)
+    attribute? :computed, ::Shop::Types::Integer.default(::Shop::Money.new(3).cents)
+    attribute? :plan, ::Shop::Types::Hash.schema(tier: ::Shop::Types::String.default("basic"))
+    attribute? :payer, ::Shop::Kinds::PAYER
+    attribute? :code, CODE
+    attribute? :shout, Upcased
+    attribute? :list, ::Shop::Types::Array.constructor { |value| Array(value) }
 
-    CURRENCY = "RUB"
   end
 end
 "#,
+        )
+        .write(
+            "lib/shop/address.rb",
+            "module Shop\n  class Address < Dry::Struct\n    attribute :city, ::Shop::Types::String\n  end\nend\n",
+        )
+        .write(
+            "lib/shop/delivery.rb",
+            "module Shop\n  class Delivery < Dry::Struct\n    attribute :to do\n      attributes_from Address\n    end\n    attribute? :raw, ::Shop::Types::JSON::Hash\n    attribute :notes?, ::Shop::Types::Array\n    attribute? :volume, ::Shop::Types::Loud\n  end\nend\n",
+        )
+        .write(
+            "lib/shop/kinds.rb",
+            "module Shop\n  module Kinds\n    PAYER = ::Shop::Types.Instance(::Shop::Money) | ::Shop::Types.Instance(::Shop::Refund)\n  end\nend\n",
         )
         .write(
             "lib/shop/client.rb",
@@ -100,15 +122,51 @@ end
         )
 }
 
-/// With a full forwarder anywhere in the app, every `X.new(**h)` has to
-/// prove its `initialize`: the structs' must be found, `::` spelling
-/// included. Interpreted lane only: Spinel refuses `...` itself.
-pub fn forwarding_overlay() -> super::emit_and_run::Overlay {
-    overlay().write(
+/// What only the interpreted lane runs. With a full forwarder anywhere in
+/// the app, every `X.new(**h)` has to prove its `initialize`: the
+/// structs' must be found, `::` spelling included; Spinel refuses `...`
+/// itself. And date and decimal coercions, which need stdlib Spinel lacks.
+pub fn ruby_overlay() -> super::emit_and_run::Overlay {
+    stamp_overlay(overlay()).write(
         "lib/shop/wrapper.rb",
         "module Shop\n  class Wrapper\n    def initialize(...)\n      setup(...)\n    end\n\n    def setup(*args, **kwargs)\n      @args = args\n    end\n  end\nend\n",
     )
 }
+
+/// A struct parsing dates and decimals.
+pub fn stamp_overlay(base: super::emit_and_run::Overlay) -> super::emit_and_run::Overlay {
+    base.write(
+        "lib/shop/stamp.rb",
+        r#"module Shop
+  class Stamp < Dry::Struct
+    attribute? :on, ::Shop::Types::Params::Date
+    attribute? :at, ::Shop::Types::JSON::DateTime
+    attribute? :seen, ::Shop::Types::Params::Time.optional
+    attribute? :price, ::Shop::Types::Coercible::Decimal
+    attribute? :fee, ::Shop::Types::Params::Decimal
+  end
+end
+"#,
+    )
+}
+
+pub const STAMP_ASSERTIONS: &str = r#"
+s = Shop::Stamp.new(on: "2026-01-02", at: "2026-01-02T10:00:00+03:00", seen: nil, price: "1.25", fee: "2.5")
+raise "date" unless s.on == Date.new(2026, 1, 2)
+raise "date time" unless s.at.hour == 10 && s.at.is_a?(DateTime)
+raise "optional time" unless s.seen.nil?
+raise "coercible decimal" unless s.price == BigDecimal("1.25")
+raise "params decimal" unless s.fee == BigDecimal("2.5")
+raise "date passes through" unless Shop::Stamp.new(on: Date.new(2020, 5, 6)).on.month == 5
+[{ on: "nope" }, { on: 5 }, { price: "x" }, { fee: "x" }].each do |bad|
+  begin
+    Shop::Stamp.new(bad)
+    raise "stamp accepted #{bad.inspect}"
+  rescue Dry::Struct::Error
+  end
+end
+puts "dry-struct stamp contract passed"
+"#;
 
 pub const ASSERTIONS: &str = r#"
 client = Shop::Client.new
@@ -205,6 +263,37 @@ end
 begin
   client.order({ amount: { value: 1 }, items: [], price: 9 })
   raise "instance accepted a number"
+rescue Dry::Struct::Error
+end
+a1 = client.order(base)
+a2 = client.order(base)
+raise "shared default" unless a1.shared == [] && a1.shared.equal?(a2.shared)
+raise "computed default" unless a1.computed == 3
+raise "schema key default" unless client.order(base.merge(plan: {})).plan == { tier: "basic" }
+raise "sum left" unless client.order(base.merge(payer: Shop::Money.new(1))).payer.cents == 1
+raise "sum right" unless client.order(base.merge(payer: r)).payer.id == "7"
+begin
+  client.order(base.merge(payer: "nobody"))
+  raise "sum accepted a string"
+rescue Dry::Struct::Error
+end
+raise "constant type" unless client.order(base.merge(code: 5)).code == "5"
+raise "constructor" unless client.order(base.merge(shout: :hi)).shout == "HI"
+raise "array constructor" unless client.order(base.merge(list: "x")).list == ["x"]
+d = Shop::Delivery.new(to: { city: "Omsk" }, raw: { "a" => 1 }, volume: :hi)
+raise "attributes_from" unless d.to.city == "Omsk" && d.to.is_a?(Shop::Delivery::To)
+raise "json hash" unless d.raw == { "a" => 1 }
+raise "name? is omittable" unless d.notes.nil? && Shop::Delivery.new(to: { city: "x" }, notes: [1]).notes == [1]
+raise "types constant constructor" unless d.volume == "HI"
+raise "constructor next" unless Shop::Delivery.new(to: { city: "x" }, volume: nil).volume == "none"
+begin
+  Shop::Delivery.new(to: { city: "x" }, raw: 1)
+  raise "json hash accepted a number"
+rescue Dry::Struct::Error
+end
+begin
+  Shop::Delivery.new(to: {})
+  raise "copied required attribute missing accepted"
 rescue Dry::Struct::Error
 end
 puts "dry-struct contract passed"

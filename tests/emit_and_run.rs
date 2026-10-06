@@ -117,9 +117,23 @@ fn finite_concern_class_configuration_runs_without_replaying_rails() {
 /// with no dry-struct in the emitted tree.
 #[test]
 fn dry_struct_classes_run_lowered() {
-    let run = dry_struct::forwarding_overlay().run_ruby(dry_struct::ASSERTIONS);
+    let run = dry_struct::ruby_overlay()
+        .run_ruby(&format!("{}\n{}", dry_struct::ASSERTIONS, dry_struct::STAMP_ASSERTIONS));
     run.assert_passes();
     assert!(run.stdout.contains("dry-struct contract passed"));
+    assert!(run.stdout.contains("dry-struct stamp contract passed"));
+}
+
+/// Spinel has no `Date`, `DateTime`, `Time.parse` or `to_d`: a lowered
+/// struct coercing with them is reported for it, not emitted to fail
+/// when first reached.
+#[test]
+fn dry_struct_date_coercions_are_reported_for_spinel() {
+    let (_emitted, errors) = dry_struct::stamp_overlay(dry_struct::overlay())
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    for construct in ["Dry::Struct date coercion", "Dry::Struct decimal coercion"] {
+        assert!(errors.iter().any(|e| e.contains(construct)), "{construct} not reported: {errors:#?}");
+    }
 }
 
 /// A struct the lowering cannot read keeps its whole `Dry::Struct`
@@ -134,7 +148,7 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
         ("lib/shop/good.rb", "module Shop\n  class Good < Base\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
         (
             "lib/shop/bad.rb",
-            "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Params::Decimal\n    attribute :other, Other\n    attribute :inner do\n      attribute :n, ::Shop::Types::Coercible::Integer\n    end\n  end\nend\n",
+            "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Strict::String.constrained(min_size: 1)\n    attribute :other, Other\n    attribute :inner do\n      attribute :n, ::Shop::Types::Coercible::Integer\n    end\n  end\nend\n",
         ),
         ("lib/shop/other.rb", "module Shop\n  class Other < Dry::Struct\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
         ("lib/shop/bulk.rb", "module Shop\n  class Bulk < Dry::Struct\n    attributes(id: ::Shop::Types::Coercible::String)\n  end\nend\n"),
