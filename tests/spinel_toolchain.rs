@@ -35,6 +35,8 @@ use roundhouse::ingest::ingest_app;
 mod emit_and_run;
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
+#[path = "support/dry_struct.rs"]
+mod dry_struct;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
 
@@ -49,6 +51,15 @@ fn finite_concern_class_configuration_runs_natively() {
         run.assert_passes();
         assert!(run.stdout.contains("finite class configuration contract passed"));
     }
+}
+
+/// The native half of `emit_and_run::dry_struct_classes_run_lowered`.
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn dry_struct_classes_run_lowered_natively() {
+    let run = dry_struct::overlay().run_spinel(dry_struct::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("dry-struct contract passed"));
 }
 
 /// The native half of `emit_and_run::rails_root_join_takes_any_number_of_parts`:

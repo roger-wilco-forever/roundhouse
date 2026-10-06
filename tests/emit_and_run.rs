@@ -9,6 +9,8 @@
 mod emit_and_run;
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
+#[path = "support/dry_struct.rs"]
+mod dry_struct;
 #[path = "support/data_factory.rs"]
 mod data_factory;
 #[path = "support/rails_root_join.rs"]
@@ -109,6 +111,40 @@ fn finite_concern_class_configuration_runs_without_replaying_rails() {
         run.assert_passes();
         assert!(run.stdout.contains("finite class configuration contract passed"));
     }
+}
+
+/// `Dry::Struct` classes construct, coerce and refuse as dry-struct does,
+/// with no dry-struct in the emitted tree.
+#[test]
+fn dry_struct_classes_run_lowered() {
+    let run = dry_struct::forwarding_overlay().run_ruby(dry_struct::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("dry-struct contract passed"));
+}
+
+/// A struct the lowering cannot read keeps its whole `Dry::Struct`
+/// hierarchy as it was: a lowered parent under an unlowered child would
+/// leave `attribute` calls on a plain class, and the stand-in
+/// `Dry::Struct` would end the child's ancestry at a class without them.
+#[test]
+fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
+    let tree = [
+        ("lib/shop/types.rb", "module Shop\n  module Types\n    include Dry.Types()\n  end\nend\n"),
+        ("lib/shop/base.rb", "module Shop\n  class Base < Dry::Struct\n  end\nend\n"),
+        ("lib/shop/good.rb", "module Shop\n  class Good < Base\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
+        ("lib/shop/bad.rb", "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Params::Decimal\n  end\nend\n"),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, s)| (std::path::PathBuf::from(p), s.as_bytes().to_vec()))
+    .collect();
+    roundhouse::ingest::survey::activate();
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let class = |name: &str| app.library_classes.iter().find(|lc| lc.name.0.as_str() == name).expect(name);
+    assert_eq!(class("Shop::Base").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
+    assert!(class("Shop::Good").methods.iter().all(|m| m.name.as_str() != "id"), "sibling lowered");
+    assert!(class("Shop::Good").unknown_calls.iter().any(|c| roundhouse::emit::ruby::emit_expr(c).starts_with("attribute")));
+    assert!(app.library_classes.iter().all(|lc| lc.name.0.as_str() != "Dry::Struct"), "stand-in added");
 }
 
 /// The harness itself: the unedited blog emits and its controller
