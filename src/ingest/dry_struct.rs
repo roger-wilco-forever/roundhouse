@@ -134,6 +134,8 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
     let mut read: HashMap<String, StructClass> = HashMap::new();
     let mut built: HashMap<String, Vec<crate::dialect::MethodDef>> = HashMap::new();
     let mut refused: HashSet<String> = HashSet::new();
+    // What each refused class names as a struct type.
+    let mut refused_names: Vec<String> = Vec::new();
     for lc in &app.library_classes {
         let name = lc.name.0.as_str();
         if !parent_of.contains_key(name) {
@@ -148,6 +150,7 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
                     message: format!("Dry::Struct not lowered: {reason}"),
                 });
                 refused.insert(name.to_string());
+                refused_names.extend(named_structs(lc, &scope));
                 continue;
             }
         };
@@ -184,7 +187,8 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         }
         cur
     };
-    let mut refused_roots: HashSet<String> = refused.iter().map(|n| root_of(n)).collect();
+    let mut refused_roots: HashSet<String> =
+        refused.iter().chain(&refused_names).map(|n| root_of(n)).collect();
     loop {
         let before = refused_roots.len();
         for (name, s) in &read {
@@ -474,6 +478,51 @@ fn is_struct_declaration(call: &Expr) -> bool {
         if matches!(method.as_str(), "attribute" | "attribute?" | "transform_keys"))
 }
 
+/// `Dry::Struct` class methods the lowering does not model.
+const DRY_STRUCT_DSL: &[&str] = &[
+    "attributes",
+    "attributes_from",
+    "transform_types",
+    "schema",
+    "abstract",
+    "input",
+    "constructor_type",
+    "load",
+];
+
+/// The struct classes a declaration names as types, read loosely: every
+/// constant anywhere in its `attribute` arguments that resolves to one.
+/// Used for a refused class, which the gem keeps, so whatever it names
+/// as a struct type must stay a `Dry::Struct` too.
+fn named_structs(lc: &LibraryClass, scope: &Scope<'_>) -> Vec<String> {
+    fn walk(expr: &Expr, scope: &Scope<'_>, out: &mut Vec<String>) {
+        if let ExprNode::Const { path } = &*expr.node {
+            let written: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+            let name = written.iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("::");
+            let full = if written.first() == Some(&"") {
+                scope.names.contains(&name).then_some(name)
+            } else {
+                resolve(scope.owner, &name, scope.names)
+            };
+            if let Some(full) = full.filter(|f| scope.structs.contains_key(f)) {
+                out.push(full);
+            }
+        }
+        expr.node.for_each_child(&mut |c| walk(c, scope, out));
+    }
+    let mut out = Vec::new();
+    for call in &lc.unknown_calls {
+        if let ExprNode::Send { recv: None, method, args, .. } = &*call.node
+            && matches!(method.as_str(), "attribute" | "attribute?")
+        {
+            for arg in args {
+                walk(arg, scope, &mut out);
+            }
+        }
+    }
+    out
+}
+
 fn read_struct(lc: &LibraryClass, scope: &Scope<'_>) -> Result<StructClass, String> {
     let mut attributes = Vec::new();
     let mut transform_keys = None;
@@ -500,6 +549,11 @@ fn read_struct(lc: &LibraryClass, scope: &Scope<'_>) -> Result<StructClass, Stri
                     format!("attribute `{}` type `{}`", name.as_str(), crate::emit::ruby::emit_expr(ty))
                 })?;
                 attributes.push(Attribute { name: name.clone(), omittable: method.as_str() == "attribute?", ty });
+            }
+            // The rest of dry-struct's class DSL changes the schema or the
+            // constructor; dropping it would lower a different struct.
+            other if DRY_STRUCT_DSL.contains(&other) => {
+                return Err(format!("`{other}` in the class body"));
             }
             _ => {}
         }
@@ -625,8 +679,9 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
             }
             "enum" if !args.is_empty() => {
                 // Literal values, or a splatted constant list.
+                // A Hash makes a mapping enum, which this does not model.
                 if !args.iter().all(|a| {
-                    literal(a)
+                    (literal(a) && !matches!(&*a.node, ExprNode::Hash { .. }))
                         || matches!(&*a.node, ExprNode::Splat { value }
                             if matches!(&*value.node, ExprNode::Const { .. }))
                 }) {

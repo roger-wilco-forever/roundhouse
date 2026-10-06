@@ -134,8 +134,10 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
         ("lib/shop/good.rb", "module Shop\n  class Good < Base\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
         (
             "lib/shop/bad.rb",
-            "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Params::Decimal\n    attribute :inner do\n      attribute :n, ::Shop::Types::Coercible::Integer\n    end\n  end\nend\n",
+            "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Params::Decimal\n    attribute :other, Other\n    attribute :inner do\n      attribute :n, ::Shop::Types::Coercible::Integer\n    end\n  end\nend\n",
         ),
+        ("lib/shop/other.rb", "module Shop\n  class Other < Dry::Struct\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
+        ("lib/shop/bulk.rb", "module Shop\n  class Bulk < Dry::Struct\n    attributes(id: ::Shop::Types::Coercible::String)\n  end\nend\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ]
     .into_iter()
@@ -152,6 +154,11 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
     // type on the gem.
     assert_eq!(class("Shop::Bad::Inner").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
     assert!(class("Shop::Bad::Inner").methods.iter().all(|m| m.name.as_str() != "n"), "nested lowered");
+    // A struct a refused class names as a type stays one, in its own
+    // hierarchy too.
+    assert_eq!(class("Shop::Other").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
+    // Unmodeled class DSL refuses rather than being dropped.
+    assert_eq!(class("Shop::Bulk").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
 }
 
 /// The harness itself: the unedited blog emits and its controller
