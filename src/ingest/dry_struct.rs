@@ -272,9 +272,8 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         }
         let Some((mut methods, generated)) = built.remove(&name) else { continue };
         lc.unknown_calls.retain(|call| !is_struct_declaration(call));
-        // A constant holding a dry type was read where an attribute names
-        // it; left in place it would build that type when the class loads.
-        lc.constants.retain(|(_, value)| !holds_dry_type(value, &types_modules));
+        // Constants holding dry types stay while anything is left on the
+        // gem, which may name them; they go app-wide below once nothing is.
         lc.constants.extend(generated);
         lc.origin = Some(crate::dialect::LibraryClassOrigin::DryStruct);
         methods.append(&mut lc.methods);
