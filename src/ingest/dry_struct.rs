@@ -640,8 +640,16 @@ fn named_structs(lc: &LibraryClass, scope: &Scope<'_>) -> Vec<String> {
             } else {
                 resolve_in(scope.owner, &name, scope.names)
             };
-            if let Some(full) = full.filter(|f| scope.structs.contains_key(f)) {
-                out.push(full);
+            match full {
+                Some(full) if scope.structs.contains_key(&full) => out.push(full),
+                // A constant holding a type names what its value names.
+                Some(full) if scope.depth <= 8 => {
+                    if let Some(value) = scope.constants.get(&full) {
+                        let holder = full.rsplit_once("::").map_or("", |(h, _)| h);
+                        walk(value, &Scope { owner: holder, depth: scope.depth + 1, ..*scope }, out);
+                    }
+                }
+                _ => {}
             }
         }
         expr.node.for_each_child(&mut |c| walk(c, scope, out));

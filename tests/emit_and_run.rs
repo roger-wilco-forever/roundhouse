@@ -148,9 +148,10 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
         ("lib/shop/good.rb", "module Shop\n  class Good < Base\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
         (
             "lib/shop/bad.rb",
-            "module Shop\n  class Bad < Base\n    attribute :amount, ::Shop::Types::Strict::String.constrained(min_size: 1)\n    attribute :other, Other\n    attribute :inner do\n      attribute :n, ::Shop::Types::Coercible::Integer\n    end\n  end\nend\n",
+            "module Shop\n  class Bad < Base\n    PIECES = ::Shop::Types::Array.of(::Shop::Piece)\n    attribute :amount, ::Shop::Types::Strict::String.constrained(min_size: 1)\n    attribute :other, Other\n    attribute :pieces, PIECES\n    attribute :inner do\n      attribute :n, ::Shop::Types::Coercible::Integer\n    end\n  end\nend\n",
         ),
         ("lib/shop/other.rb", "module Shop\n  class Other < Dry::Struct\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
+        ("lib/shop/piece.rb", "module Shop\n  class Piece < Dry::Struct\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
         ("lib/shop/bulk.rb", "module Shop\n  class Bulk < Dry::Struct\n    attributes(id: ::Shop::Types::Coercible::String)\n  end\nend\n"),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ]
@@ -171,6 +172,8 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
     // A struct a refused class names as a type stays one, in its own
     // hierarchy too.
     assert_eq!(class("Shop::Other").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
+    // ... also when it names it through a constant holding a type.
+    assert_eq!(class("Shop::Piece").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
     // Unmodeled class DSL refuses rather than being dropped.
     assert_eq!(class("Shop::Bulk").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
 }
