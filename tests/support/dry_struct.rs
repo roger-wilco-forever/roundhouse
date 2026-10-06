@@ -98,6 +98,10 @@ end
             "module Shop\n  class Tagged < Dry::Struct\n    attribute :a, ::Shop::Types.Constructor(String) { |v| \"p#{v}\" }\n    attribute? :n, ::Shop::Types::Strict::Integer.constructor { |v|\n      next \"bad\" if v == :x\n\n      v\n    }\n  end\n\n  class TaggedChild < Tagged\n    attribute :b, ::Shop::Types.Constructor(String) { |v| \"c#{v}\" }\n  end\nend\n",
         )
         .write(
+            "lib/shop/stamp.rb",
+            "module Shop\n  class Stamp < Dry::Struct\n    attribute? :on, ::Shop::Types::Params::Date\n    attribute? :due, ::Shop::Types::Strict::Date\n    attribute? :price, ::Shop::Types::Coercible::Decimal\n  end\nend\n",
+        )
+        .write(
             "lib/shop/kinds.rb",
             "module Shop\n  module Kinds\n    PAYER = ::Shop::Types.Instance(::Shop::Money) | ::Shop::Types.Instance(::Shop::Refund)\n  end\nend\n",
         )
@@ -129,40 +133,55 @@ end
 /// What only the interpreted lane runs. With a full forwarder anywhere in
 /// the app, every `X.new(**h)` has to prove its `initialize`: the
 /// structs' must be found, `::` spelling included; Spinel refuses `...`
-/// itself. And date and decimal coercions, which need stdlib Spinel lacks.
+/// itself. And the coercions needing stdlib Spinel's tree lacks.
 pub fn ruby_overlay() -> super::emit_and_run::Overlay {
-    stamp_overlay(overlay()).write(
+    clock_overlay(overlay()).write(
         "lib/shop/wrapper.rb",
         "module Shop\n  class Wrapper\n    def initialize(...)\n      setup(...)\n    end\n\n    def setup(*args, **kwargs)\n      @args = args\n    end\n  end\nend\n",
     )
 }
 
-/// A struct parsing dates and decimals.
-pub fn stamp_overlay(base: super::emit_and_run::Overlay) -> super::emit_and_run::Overlay {
+/// `DateTime`, `Time.parse` and `to_d`'s loose String parsing: CRuby's
+/// and JRuby's stdlib only.
+pub fn clock_overlay(base: super::emit_and_run::Overlay) -> super::emit_and_run::Overlay {
     base.write(
-        "lib/shop/stamp.rb",
+        "lib/shop/clock.rb",
         r#"module Shop
-  class Stamp < Dry::Struct
-    attribute? :on, ::Shop::Types::Params::Date
+  class Clock < Dry::Struct
     attribute? :at, ::Shop::Types::JSON::DateTime
     attribute? :seen, ::Shop::Types::Params::Time.optional
-    attribute? :price, ::Shop::Types::Coercible::Decimal
     attribute? :fee, ::Shop::Types::Params::Decimal
+    attribute? :stamped, ::Shop::Types::Strict::DateTime
   end
 end
 "#,
     )
 }
 
+pub const CLOCK_ASSERTIONS: &str = r#"
+c = Shop::Clock.new(at: "2026-01-02T10:00:00+03:00", seen: nil, fee: "2.5")
+raise "date time" unless c.at.hour == 10 && c.at.is_a?(DateTime)
+raise "optional time" unless c.seen.nil?
+raise "params decimal" unless c.fee == BigDecimal("2.5")
+raise "strict date time" unless Shop::Clock.new(stamped: c.at).stamped == c.at
+[{ at: "nope" }, { fee: "x" }, { stamped: "2026-01-02" }].each do |bad|
+  begin
+    Shop::Clock.new(bad)
+    raise "clock accepted #{bad.inspect}"
+  rescue Dry::Struct::Error
+  end
+end
+puts "dry-struct clock contract passed"
+"#;
+
+/// Spinel's tree has `Date` and `BigDecimal()`: both lanes run these.
 pub const STAMP_ASSERTIONS: &str = r#"
-s = Shop::Stamp.new(on: "2026-01-02", at: "2026-01-02T10:00:00+03:00", seen: nil, price: "1.25", fee: "2.5")
+s = Shop::Stamp.new(on: "2026-01-02", price: "1.25")
 raise "date" unless s.on == Date.new(2026, 1, 2)
-raise "date time" unless s.at.hour == 10 && s.at.is_a?(DateTime)
-raise "optional time" unless s.seen.nil?
-raise "coercible decimal" unless s.price == BigDecimal("1.25")
-raise "params decimal" unless s.fee == BigDecimal("2.5")
 raise "date passes through" unless Shop::Stamp.new(on: Date.new(2020, 5, 6)).on.month == 5
-[{ on: "nope" }, { on: 5 }, { price: "x" }, { fee: "x" }].each do |bad|
+raise "strict date" unless Shop::Stamp.new(due: s.on).due == s.on
+raise "coercible decimal" unless s.price == BigDecimal("1.25")
+[{ on: "nope" }, { on: 5 }, { due: "2026-01-02" }, { price: "x" }].each do |bad|
   begin
     Shop::Stamp.new(bad)
     raise "stamp accepted #{bad.inspect}"

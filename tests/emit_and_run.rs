@@ -117,22 +117,30 @@ fn finite_concern_class_configuration_runs_without_replaying_rails() {
 /// with no dry-struct in the emitted tree.
 #[test]
 fn dry_struct_classes_run_lowered() {
-    let run = dry_struct::ruby_overlay()
-        .run_ruby(&format!("{}\n{}", dry_struct::ASSERTIONS, dry_struct::STAMP_ASSERTIONS));
+    let run = dry_struct::ruby_overlay().run_ruby(&format!(
+        "{}\n{}\n{}",
+        dry_struct::ASSERTIONS,
+        dry_struct::STAMP_ASSERTIONS,
+        dry_struct::CLOCK_ASSERTIONS
+    ));
     run.assert_passes();
     assert!(run.stdout.contains("dry-struct contract passed"));
     assert!(run.stdout.contains("dry-struct stamp contract passed"));
+    assert!(run.stdout.contains("dry-struct clock contract passed"));
 }
 
-/// Spinel has no `Date`, `DateTime`, `Time.parse` or `to_d`: a lowered
-/// struct coercing with them is reported for it, not emitted to fail
-/// when first reached.
+/// Spinel's tree has its own `Date` and `BigDecimal()`, but no
+/// `DateTime`, `Time.parse` or `BigDecimal.interpret_loosely`: a lowered
+/// struct using those is reported for it, not emitted to fail when first
+/// reached, and one using only the former is not.
 #[test]
-fn dry_struct_date_coercions_are_reported_for_spinel() {
-    let (_emitted, errors) = dry_struct::stamp_overlay(dry_struct::overlay())
+fn dry_struct_stdlib_coercions_are_reported_for_spinel() {
+    let (_emitted, errors) = dry_struct::overlay().emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().all(|e| !e.contains("Dry::Struct")), "{errors:#?}");
+    let (_emitted, errors) = dry_struct::clock_overlay(dry_struct::overlay())
         .emit(roundhouse::project::BuildTarget::Spinel);
-    for construct in ["Dry::Struct date coercion", "Dry::Struct decimal coercion"] {
-        assert!(errors.iter().any(|e| e.contains(construct)), "{construct} not reported: {errors:#?}");
+    for what in ["`DateTime`", "`Time.parse`", "`BigDecimal.interpret_loosely`"] {
+        assert!(errors.iter().any(|e| e.contains(what)), "{what} not reported: {errors:#?}");
     }
 }
 

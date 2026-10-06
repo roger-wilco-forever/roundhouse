@@ -57,9 +57,11 @@ fn finite_concern_class_configuration_runs_natively() {
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]
 fn dry_struct_classes_run_lowered_natively() {
-    let run = dry_struct::overlay().run_spinel(dry_struct::ASSERTIONS);
+    let run = dry_struct::overlay()
+        .run_spinel(&format!("{}\n{}", dry_struct::ASSERTIONS, dry_struct::STAMP_ASSERTIONS));
     run.assert_passes();
     assert!(run.stdout.contains("dry-struct contract passed"));
+    assert!(run.stdout.contains("dry-struct stamp contract passed"));
 }
 
 /// The native half of `emit_and_run::rails_root_join_takes_any_number_of_parts`:

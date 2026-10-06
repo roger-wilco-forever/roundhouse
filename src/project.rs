@@ -1071,38 +1071,43 @@ fn report_sqlite_index_predicates(app: &App, target: BuildTarget) {
 }
 
 /// The date and decimal coercions `ingest::dry_struct` generates call
-/// `Date`/`DateTime`/`Time.parse` and `BigDecimal.interpret_loosely`:
-/// stdlib the CRuby and JRuby trees load, and no other target's runtime
-/// has.
+/// stdlib the CRuby and JRuby trees load. Spinel's tree has its own
+/// `Date` (`runtime/spinel/date.rb`, ISO `parse` included) and
+/// `BigDecimal()`, but no `DateTime`, `Time.parse` or
+/// `BigDecimal.interpret_loosely`; the other targets have none of them.
 fn report_dry_struct_stdlib(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
         return;
     }
     fn visit(expr: &crate::expr::Expr, target: BuildTarget) {
         use crate::expr::ExprNode;
+        let spinel = matches!(target, BuildTarget::Spinel);
+        let named = |path: &[crate::ident::Symbol]| -> Vec<String> {
+            path.iter().map(|p| p.as_str().to_string()).filter(|p| !p.is_empty()).collect()
+        };
         let construct = match &*expr.node {
-            ExprNode::Send { recv: Some(recv), method, .. } if method.as_str() == "parse" => {
-                match &*recv.node {
-                    ExprNode::Const { path }
-                        if matches!(
-                            path.iter().map(|p| p.as_str()).filter(|p| !p.is_empty()).collect::<Vec<_>>()[..],
-                            ["Date" | "DateTime" | "Time"]
-                        ) =>
-                    {
-                        Some("Dry::Struct date coercion")
-                    }
-                    _ => None,
-                }
-            }
+            ExprNode::Send { recv: Some(recv), method, .. } if method.as_str() == "parse" => match &*recv.node {
+                ExprNode::Const { path } if named(path) == ["Time"] => Some(("Time.parse", "Dry::Struct date coercion")),
+                _ => None,
+            },
             ExprNode::Send { method, .. } if method.as_str() == "interpret_loosely" => {
-                Some("Dry::Struct decimal coercion")
+                Some(("BigDecimal.interpret_loosely", "Dry::Struct decimal coercion"))
+            }
+            ExprNode::Send { recv: None, method, .. } if method.as_str() == "BigDecimal" && !spinel => {
+                Some(("BigDecimal()", "Dry::Struct decimal coercion"))
+            }
+            ExprNode::Const { path } if named(path) == ["DateTime"] => Some(("DateTime", "Dry::Struct date coercion")),
+            ExprNode::Const { path } if named(path) == ["Date"] && !spinel => {
+                Some(("Date", "Dry::Struct date coercion"))
             }
             _ => None,
         };
-        if let Some(construct) = construct {
+        if let Some((what, construct)) = construct {
             crate::emit::diagnostics::report_unsupported(
-                expr.span, target.as_str(), construct,
-                "Date, DateTime, Time.parse and BigDecimal.interpret_loosely have no runtime on this target",
+                expr.span,
+                target.as_str(),
+                construct,
+                &format!("`{what}` has no runtime on this target"),
             );
         }
         expr.node.for_each_child(&mut |child| visit(child, target));
