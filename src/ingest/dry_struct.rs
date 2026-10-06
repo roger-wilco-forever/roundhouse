@@ -79,7 +79,7 @@ impl DryType {
 /// Where a type expression is read from: the `Types` modules, and the
 /// struct classes a constant may name from inside `owner`.
 struct Scope<'a> {
-    types_modules: &'a [String],
+    types_modules: &'a [(String, BareNames)],
     owner: &'a str,
     names: &'a HashSet<String>,
     structs: &'a HashMap<String, Option<String>>,
@@ -265,7 +265,7 @@ fn struct_parents(classes: &[LibraryClass]) -> HashMap<String, Option<String>> {
 fn expand_nested(
     app: &mut App,
     parent_of: &mut HashMap<String, Option<String>>,
-    types_modules: &[String],
+    types_modules: &[(String, BareNames)],
 ) -> HashMap<String, String> {
     let mut owner_of: HashMap<String, String> = HashMap::new();
     let mut queue: Vec<String> = parent_of.keys().cloned().collect();
@@ -288,7 +288,8 @@ fn expand_nested(
                 [name] => (None, name),
                 [name, ty] => match &*ty.node {
                     ExprNode::Const { path }
-                        if types_path(path, types_modules).is_some_and(|rest| rest == ["Array"]) =>
+                        if types_path(path, types_modules)
+                            .is_some_and(|rest| matches!(rest.as_slice(), [_, "Array"] | ["Array"])) =>
                     {
                         (Some(ty.clone()), name)
                     }
@@ -391,13 +392,23 @@ fn error_classes() -> Vec<LibraryClass> {
         .expect("the Dry::Struct::Error stand-in parses")
 }
 
+/// A `Types` module and what its bare names (`Types::String`) mean:
+/// `Dry.Types()` makes them strict, `Dry.Types(default: :nominal)`
+/// nominal. Any other arguments leave them unread.
+#[derive(Clone, Copy, PartialEq)]
+enum BareNames {
+    Strict,
+    Nominal,
+    Unknown,
+}
+
 /// Modules that `include Dry.Types()`: the `Types::` namespace. Read
 /// from the source, since a module holding nothing else ingests to no
 /// class at all.
-fn types_modules(sources: &[crate::span::SourceFile]) -> Vec<String> {
+fn types_modules(sources: &[crate::span::SourceFile]) -> Vec<(String, BareNames)> {
     struct Finder {
         nesting: Vec<String>,
-        found: Vec<String>,
+        found: Vec<(String, BareNames)>,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Finder {
         fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
@@ -407,21 +418,30 @@ fn types_modules(sources: &[crate::span::SourceFile]) -> Vec<String> {
             self.nesting.pop();
         }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-            let includes_dry_types = node.receiver().is_none()
-                && node.name().as_slice() == b"include"
-                && node.arguments().is_some_and(|args| {
-                    args.arguments().iter().any(|arg| {
-                        arg.as_call_node().is_some_and(|call| {
-                            call.name().as_slice() == b"Types"
-                                && call.receiver().is_some_and(|r| {
-                                    let text = r.location().as_slice();
-                                    text == b"Dry" || text == b"::Dry"
-                                })
-                        })
+            let dry_types = (node.receiver().is_none() && node.name().as_slice() == b"include")
+                .then(|| node.arguments())
+                .flatten()
+                .and_then(|args| {
+                    args.arguments().iter().find_map(|arg| {
+                        let call = arg.as_call_node()?;
+                        let text = call.receiver()?.location().as_slice().to_vec();
+                        (call.name().as_slice() == b"Types" && (text == b"Dry" || text == b"::Dry"))
+                            .then_some(call)
                     })
                 });
-            if includes_dry_types && !self.nesting.is_empty() {
-                self.found.push(self.nesting.join("::"));
+            if let Some(call) = dry_types
+                && !self.nesting.is_empty()
+            {
+                let args = call
+                    .arguments()
+                    .map(|a| String::from_utf8_lossy(a.location().as_slice()).replace(' ', ""))
+                    .unwrap_or_default();
+                let bare = match args.as_str() {
+                    "" | "default::strict" => BareNames::Strict,
+                    "default::nominal" => BareNames::Nominal,
+                    _ => BareNames::Unknown,
+                };
+                self.found.push((self.nesting.join("::"), bare));
             }
             ruby_prism::visit_call_node(self, node);
         }
@@ -531,11 +551,9 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 ["Strict", "Time"] => Base::Instance("::Time".into()),
                 ["Strict", "DateTime"] => Base::Instance("::DateTime".into()),
                 ["Strict", "Date"] => Base::Instance("::Date".into()),
-                [t] | ["Nominal", t]
-                    if matches!(
-                        *t,
-                        "String" | "Integer" | "Float" | "Bool" | "Hash" | "Array" | "Any" | "Symbol"
-                    ) =>
+                ["Any"] => Base::Nominal,
+                ["Nominal", t]
+                    if matches!(*t, "String" | "Integer" | "Float" | "Bool" | "Hash" | "Array" | "Any" | "Symbol") =>
                 {
                     Base::Nominal
                 }
@@ -590,7 +608,7 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                     return None;
                 };
                 let ExprNode::Const { path } = &*recv.node else { return None };
-                if !matches!(types_path(path, scope.types_modules)?.as_slice(), ["Hash"] | ["Strict", "Hash"]) {
+                if !matches!(types_path(path, scope.types_modules)?.as_slice(), ["Strict" | "Nominal", "Hash"]) {
                     return None;
                 }
                 let mut keys = Vec::new();
@@ -625,7 +643,7 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                 let [member] = args.as_slice() else { return None };
                 let ExprNode::Const { path } = &*recv.node else { return None };
                 let strict = match types_path(path, scope.types_modules)?.as_slice() {
-                    ["Array"] | ["Nominal", "Array"] => false,
+                    ["Nominal", "Array"] => false,
                     ["Strict", "Array"] => true,
                     _ => return None,
                 };
@@ -652,14 +670,25 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
 /// The part of `path` after a `Types` module: `Coercible::String` from
 /// `::Randewoo::Types::Coercible::String`. The prefix must name a module
 /// that includes `Dry.Types()`, fully or by its last segments.
-fn types_path<'a>(path: &'a [Symbol], types_modules: &[String]) -> Option<Vec<&'a str>> {
+///
+/// A bare name is given the namespace the module defaults it to:
+/// `Types::String` is `Strict::String` under `Dry.Types()`. `Any` is
+/// nominal whatever the default.
+fn types_path<'a>(path: &'a [Symbol], types_modules: &[(String, BareNames)]) -> Option<Vec<&'a str>> {
     let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
     let at = segments.iter().rposition(|s| *s == "Types")?;
     let prefix = segments[..=at].join("::");
-    types_modules
+    let (_, bare) = types_modules
         .iter()
-        .any(|m| *m == prefix || m.ends_with(&format!("::{prefix}")))
-        .then(|| segments[at + 1..].to_vec())
+        .find(|(m, _)| *m == prefix || m.ends_with(&format!("::{prefix}")))?;
+    let rest = segments[at + 1..].to_vec();
+    Some(match (rest.as_slice(), bare) {
+        ([name], _) if *name == "Any" => rest,
+        ([name], BareNames::Strict) => vec!["Strict", name],
+        ([name], BareNames::Nominal) => vec!["Nominal", name],
+        ([name], BareNames::Unknown) => vec!["?", name],
+        _ => rest,
+    })
 }
 
 /// Whether `expr` reads the receiver it runs on: a bare call, an ivar,

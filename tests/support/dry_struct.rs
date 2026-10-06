@@ -65,6 +65,10 @@ end
       ::Shop::Types::Strict::Hash.schema(sku: ::Shop::Types::Strict::String.meta(omittable: true))
     )
     attribute? :token, ::Shop::Types::Coercible::String.default { Shop::Money.new(7).cents.to_s }
+    attribute? :label, ::Shop::Types::String
+    attribute? :codes, ::Shop::Types::Array.of(::Shop::Types::String)
+    attribute? :anything, ::Shop::Types::Any
+    attribute? :loose, ::Shop::Types::Nominal::String
 
     CURRENCY = "RUB"
   end
@@ -148,6 +152,18 @@ raise "constant default" unless o.currency == "RUB"
 raise "block default" unless o.rush == false
 raise "default then enum" unless o.source == "WEB"
 raise "computed default" unless o.token == "7"
+# Under `Dry.Types()` a bare name is strict; `Any` and `Nominal::` are not.
+base = { amount: { value: 1 }, items: [] }
+raise "bare strict ok" unless client.order(base.merge(label: "x", codes: ["a"])).label == "x"
+raise "any" unless client.order(base.merge(anything: 5)).anything == 5
+raise "nominal" unless client.order(base.merge(loose: 5)).loose == 5
+[{ label: 1 }, { codes: [1] }, { codes: "a" }].each do |bad|
+  begin
+    client.order(base.merge(bad))
+    raise "bare name accepted #{bad.inspect}"
+  rescue Dry::Struct::Error
+  end
+end
 now = Time.now
 t = client.order({ amount: { value: 1 }, items: [], at: now, extra: nil, lines: [{}, { sku: "s" }] })
 raise "strict time" unless t.at == now
