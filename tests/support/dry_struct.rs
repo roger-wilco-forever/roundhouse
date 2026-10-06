@@ -94,6 +94,10 @@ end
             "module Shop\n  class Delivery < Dry::Struct\n    attribute :to do\n      attributes_from Address\n    end\n    attribute? :raw, ::Shop::Types::JSON::Hash\n    attribute :notes?, ::Shop::Types::Array\n    attribute? :volume, ::Shop::Types::Loud\n  end\nend\n",
         )
         .write(
+            "lib/shop/tagged.rb",
+            "module Shop\n  class Tagged < Dry::Struct\n    attribute :a, ::Shop::Types.Constructor(String) { |v| \"p#{v}\" }\n    attribute? :n, ::Shop::Types::Strict::Integer.constructor { |v|\n      next \"bad\" if v == :x\n\n      v\n    }\n  end\n\n  class TaggedChild < Tagged\n    attribute :b, ::Shop::Types.Constructor(String) { |v| \"c#{v}\" }\n  end\nend\n",
+        )
+        .write(
             "lib/shop/kinds.rb",
             "module Shop\n  module Kinds\n    PAYER = ::Shop::Types.Instance(::Shop::Money) | ::Shop::Types.Instance(::Shop::Refund)\n  end\nend\n",
         )
@@ -294,6 +298,14 @@ end
 begin
   Shop::Delivery.new(to: {})
   raise "copied required attribute missing accepted"
+rescue Dry::Struct::Error
+end
+tc = Shop::TaggedChild.new(a: 1, b: 2)
+raise "parent constructor shadowed: #{tc.a}" unless tc.a == "p1" && tc.b == "c2"
+raise "constructor value" unless Shop::Tagged.new(a: 1, n: 4).n == 4
+begin
+  Shop::Tagged.new(a: 1, n: :x)
+  raise "next skipped the type check"
 rescue Dry::Struct::Error
 end
 puts "dry-struct contract passed"

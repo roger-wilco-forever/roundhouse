@@ -220,10 +220,12 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
             Ok(_) => {
                 survey::record_synthesis_failure(name.to_string(), "Dry::Struct lowering", &diags);
                 refused.insert(name.to_string());
+                refused_names.extend(s.structs());
             }
             Err(err) => {
                 survey::record(&err);
                 refused.insert(name.to_string());
+                refused_names.extend(s.structs());
             }
         }
         read.insert(name.to_string(), s);
@@ -1020,6 +1022,8 @@ fn literal(expr: &Expr) -> bool {
 /// per shared default, a class method per constructor block.
 #[derive(Default)]
 struct Gen {
+    /// The struct class being generated, by full name.
+    owner: String,
     constants: Vec<String>,
     helpers: Vec<String>,
 }
@@ -1108,18 +1112,21 @@ fn coerced(extra: &mut Gen, ty: &DryType, value: &str, key: &str) -> String {
                 format!("(begin\n  {first}\nrescue Dry::Struct::Error\n  {rest}\nend)")
             })
         }
-        // A class method holding the block, its value then checked.
+        // The block as a class method of its own, where its `next` (now
+        // `return`) ends only the block; a second checks its value. Called
+        // on the class that defines them: a subclass's helpers of the same
+        // name must not answer for a parent's attribute.
         Base::Constructor { param, body, then } => {
             let slot = extra.helpers.len();
             let name = format!("dry_struct_constructor_{slot}");
             extra.helpers.push(String::new());
             let checked = coerced(extra, then, "dry_struct_value", key);
             extra.helpers[slot] = format!(
-                "  def self.{name}({param})\n    dry_struct_value = (begin\n{}\nend)\n    {checked}\n  end\n",
+                "  def self.{name}_block({param})\n{}\n  end\n\n  def self.{name}(value)\n    dry_struct_value = {name}_block(value)\n    {checked}\n  end\n",
                 crate::emit::ruby::emit_expr(body),
                 param = param.as_str(),
             );
-            format!("self.class.{name}({value})")
+            format!("::{}.{name}({value})", extra.owner)
         }
     };
     let inner = match &ty.enumeration {
@@ -1137,7 +1144,7 @@ fn coerced(extra: &mut Gen, ty: &DryType, value: &str, key: &str) -> String {
 }
 
 fn synthesized_source(owner: &str, s: &StructClass, is_root: bool) -> String {
-    let mut extra = Gen::default();
+    let mut extra = Gen { owner: owner.to_string(), ..Gen::default() };
     let mut body = String::new();
     if is_root || s.transform_keys.is_some() {
         let keys = match &s.transform_keys {
