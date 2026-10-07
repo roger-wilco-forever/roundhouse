@@ -354,48 +354,57 @@ fn expand_nested(
 /// it stays, and the class is refused for it.
 fn inline_attributes_from(app: &mut App, parent_of: &HashMap<String, Option<String>>) {
     let names: HashSet<String> = app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
-    let calls_of = |name: &str| -> Option<Vec<Expr>> {
-        let mut chain = Vec::new();
-        let mut cur = Some(name.to_string());
-        while let Some(n) = cur {
-            chain.push(n.clone());
-            cur = parent_of.get(&n).cloned().flatten();
-        }
-        let mut out = Vec::new();
-        for n in chain.iter().rev() {
-            let lc = app.library_classes.iter().find(|lc| lc.name.0.as_str() == n)?;
-            for call in &lc.unknown_calls {
-                let ExprNode::Send { recv: None, method, .. } = &*call.node else { continue };
-                if matches!(method.as_str(), "attribute" | "attribute?") {
-                    out.push(call.clone());
+    // Sources first, round by round; a cycle is left to refuse.
+    loop {
+        let calls_of = |name: &str| -> Option<Vec<Expr>> {
+            let mut chain = Vec::new();
+            let mut cur = Some(name.to_string());
+            while let Some(n) = cur {
+                chain.push(n.clone());
+                cur = parent_of.get(&n).cloned().flatten();
+            }
+            let mut out = Vec::new();
+            for n in chain.iter().rev() {
+                let lc = app.library_classes.iter().find(|lc| lc.name.0.as_str() == n)?;
+                for call in &lc.unknown_calls {
+                    let ExprNode::Send { recv: None, method, .. } = &*call.node else { continue };
+                    match method.as_str() {
+                        "attribute" | "attribute?" => out.push(call.clone()),
+                        // Not inlined yet: wait for it, so its keys come along.
+                        "attributes_from" => return None,
+                        _ => {}
+                    }
+                }
+            }
+            out.iter().all(absolute_constants).then_some(out)
+        };
+        let mut rewrites: Vec<(usize, usize, Vec<Expr>)> = Vec::new();
+        for (ci, lc) in app.library_classes.iter().enumerate() {
+            let owner = lc.name.0.as_str();
+            if !parent_of.contains_key(owner) {
+                continue;
+            }
+            for (ui, call) in lc.unknown_calls.iter().enumerate() {
+                let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { continue };
+                if method.as_str() != "attributes_from" {
+                    continue;
+                }
+                let [ExprNode::Const { path }] = args.iter().map(|a| &*a.node).collect::<Vec<_>>()[..] else { continue };
+                let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                let Some(source) = resolve_in(owner, &written, &names).filter(|n| parent_of.contains_key(n)) else {
+                    continue;
+                };
+                if let Some(calls) = calls_of(&source) {
+                    rewrites.push((ci, ui, calls));
                 }
             }
         }
-        out.iter().all(absolute_constants).then_some(out)
-    };
-    let mut rewrites: Vec<(usize, usize, Vec<Expr>)> = Vec::new();
-    for (ci, lc) in app.library_classes.iter().enumerate() {
-        let owner = lc.name.0.as_str();
-        if !parent_of.contains_key(owner) {
-            continue;
+        if rewrites.is_empty() {
+            break;
         }
-        for (ui, call) in lc.unknown_calls.iter().enumerate() {
-            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { continue };
-            if method.as_str() != "attributes_from" {
-                continue;
-            }
-            let [ExprNode::Const { path }] = args.iter().map(|a| &*a.node).collect::<Vec<_>>()[..] else { continue };
-            let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
-            let Some(source) = resolve_in(owner, &written, &names).filter(|n| parent_of.contains_key(n)) else {
-                continue;
-            };
-            if let Some(calls) = calls_of(&source) {
-                rewrites.push((ci, ui, calls));
-            }
+        for (ci, ui, calls) in rewrites.into_iter().rev() {
+            app.library_classes[ci].unknown_calls.splice(ui..=ui, calls);
         }
-    }
-    for (ci, ui, calls) in rewrites.into_iter().rev() {
-        app.library_classes[ci].unknown_calls.splice(ui..=ui, calls);
     }
 }
 

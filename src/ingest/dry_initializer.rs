@@ -288,10 +288,11 @@ pub(super) fn drop_unused_type_constants(app: &mut App, sources: &[crate::span::
         .iter()
         .map(|lc| lc.name.0.as_str().to_string())
         .collect();
+    let plain = super::dry_types::plain_constants(&app.library_classes, &types_modules, &names);
     for lc in &mut app.library_classes {
         let holder = lc.name.0.as_str().to_string();
         lc.constants.retain(|(_, value)| {
-            !super::dry_types::holds_dry_type(value, &holder, &types_modules, &names)
+            !super::dry_types::holds_dry_type(value, &holder, &types_modules, &names, &plain)
         });
     }
 }
@@ -625,11 +626,13 @@ fn uses_dry_types(app: &App, types_modules: &[(String, BareNames)]) -> bool {
         .iter()
         .map(|lc| lc.name.0.as_str().to_string())
         .collect();
+    let plain = super::dry_types::plain_constants(&app.library_classes, types_modules, &names);
     fn builds(
         expr: &Expr,
         holder: &str,
         types_modules: &[(String, BareNames)],
         names: &HashSet<String>,
+        plain: &HashSet<String>,
     ) -> bool {
         let own = match &*expr.node {
             ExprNode::Send {
@@ -641,16 +644,15 @@ fn uses_dry_types(app: &App, types_modules: &[(String, BareNames)]) -> bool {
                     || (method.as_str() == "Types" && is_const(recv, "Dry"))
             }
             _ => false,
-        } || super::dry_types::holds_dry_type(expr, holder, types_modules, names);
+        } || super::dry_types::holds_dry_type(expr, holder, types_modules, names, plain);
         let mut found = own;
         expr.node
-            .for_each_child(&mut |c| found |= builds(c, holder, types_modules, names));
+            .for_each_child(&mut |c| found |= builds(c, holder, types_modules, names, plain));
         found
     }
     app.library_classes.iter().any(|lc| {
         let holder = lc.name.0.as_str();
-        // A `Types` module is not emitted; its own `include Dry.Types()`
-        // goes with it.
+        // A `Types` module's own `include Dry.Types()` is not emitted.
         if types_modules.iter().any(|(m, _)| m == holder) {
             return false;
         }
@@ -660,11 +662,11 @@ fn uses_dry_types(app: &App, types_modules: &[(String, BareNames)]) -> bool {
             || lc
                 .unknown_calls
                 .iter()
-                .any(|c| extends_initializer(c) || builds(c, holder, types_modules, &names))
+                .any(|c| extends_initializer(c) || builds(c, holder, types_modules, &names, &plain))
             || lc
                 .methods
                 .iter()
-                .any(|m| builds(&m.body, holder, types_modules, &names))
+                .any(|m| builds(&m.body, holder, types_modules, &names, &plain))
     })
 }
 

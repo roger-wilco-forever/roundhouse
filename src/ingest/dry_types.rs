@@ -421,12 +421,30 @@ pub(super) fn types_path<'a>(
     types_modules: &[(String, BareNames)],
     names: &HashSet<String>,
 ) -> Option<Vec<&'a str>> {
+    let (_, bare, rest) = types_module_of(path, owner, types_modules, names)?;
+    Some(match (rest.as_slice(), bare) {
+        ([name], _) if *name == "Any" => rest,
+        ([name], BareNames::Strict) => vec!["Strict", name],
+        ([name], BareNames::Nominal) => vec!["Nominal", name],
+        ([name], BareNames::Unknown) => vec!["?", name],
+        _ => rest,
+    })
+}
+
+/// The `Types` module `path` reads, its bare names, and the segments
+/// after it as written.
+pub(super) fn types_module_of<'a>(
+    path: &'a [Symbol],
+    owner: &str,
+    types_modules: &[(String, BareNames)],
+    names: &HashSet<String>,
+) -> Option<(String, BareNames, Vec<&'a str>)> {
     let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
     let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
     let at = segments.iter().rposition(|s| *s == "Types")?;
     let prefix = segments[..=at].join("::");
     let find = |full: &str| types_modules.iter().find(|(m, _)| m == full);
-    let (_, bare) = if absolute {
+    let (module, bare) = if absolute {
         find(&prefix)?
     } else {
         let mut scope: Vec<&str> = owner.split("::").filter(|s| !s.is_empty()).collect();
@@ -434,6 +452,19 @@ pub(super) fn types_path<'a>(
             let candidate =
                 if scope.is_empty() { prefix.clone() } else { format!("{}::{prefix}", scope.join("::")) };
             if let Some(found) = find(&candidate) {
+                // Past the lexical scopes Ruby searches the owner's
+                // ancestors before the top level, and any `X::Types` off
+                // that path may be one of them. Only a different meaning
+                // for bare names matters; that is refused, not guessed.
+                // ponytail: no ancestor walk here; read the ancestry if a
+                // real app nests `Types` modules with differing defaults.
+                if scope.is_empty()
+                    && types_modules.iter().any(|(m, b)| {
+                        *b != found.1 && m.ends_with(&format!("::{prefix}"))
+                    })
+                {
+                    return None;
+                }
                 break found;
             }
             if names.contains(&candidate) || scope.is_empty() {
@@ -442,14 +473,7 @@ pub(super) fn types_path<'a>(
             scope.pop();
         }
     };
-    let rest = segments[at + 1..].to_vec();
-    Some(match (rest.as_slice(), bare) {
-        ([name], _) if *name == "Any" => rest,
-        ([name], BareNames::Strict) => vec!["Strict", name],
-        ([name], BareNames::Nominal) => vec!["Nominal", name],
-        ([name], BareNames::Unknown) => vec!["?", name],
-        _ => rest,
-    })
+    Some((module.clone(), *bare, segments[at + 1..].to_vec()))
 }
 
 /// A block body as a method body: its own `next` becomes `return`. A
@@ -472,18 +496,49 @@ pub(super) fn next_to_return(expr: &Expr) -> Expr {
     body
 }
 
-/// Whether `expr` builds a dry type: it reads a `Types` module.
+/// Whether `expr` builds a dry type: it reads a `Types` module, other
+/// than a `plain` constant declared there (`Types::LABEL = "x"`).
 pub(super) fn holds_dry_type(
     expr: &Expr,
     holder: &str,
     types_modules: &[(String, BareNames)],
     names: &HashSet<String>,
+    plain: &HashSet<String>,
 ) -> bool {
     let own = matches!(&*expr.node, ExprNode::Const { path }
-        if types_path(path, holder, types_modules, names).is_some());
+        if types_module_of(path, holder, types_modules, names)
+            .is_some_and(|(module, _, rest)| !plain.contains(&format!("{module}::{}", rest.join("::")))));
     let mut found = own;
-    expr.node.for_each_child(&mut |c| found |= holds_dry_type(c, holder, types_modules, names));
+    expr.node.for_each_child(&mut |c| found |= holds_dry_type(c, holder, types_modules, names, plain));
     found
+}
+
+/// The `Types` modules' own constants that build no type, an alias of
+/// one (`ALIAS = Types::LABEL`) included: round by round.
+pub(super) fn plain_constants(
+    classes: &[crate::dialect::LibraryClass],
+    types_modules: &[(String, BareNames)],
+    names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut plain: HashSet<String> = HashSet::new();
+    loop {
+        let found: Vec<String> = classes
+            .iter()
+            .filter(|lc| types_modules.iter().any(|(m, _)| m == lc.name.0.as_str()))
+            .flat_map(|lc| {
+                let holder = lc.name.0.as_str();
+                lc.constants.iter().map(move |(n, v)| (format!("{holder}::{}", n.as_str()), v, holder))
+            })
+            .filter(|(full, v, holder)| {
+                !plain.contains(full) && !holds_dry_type(v, holder, types_modules, names, &plain)
+            })
+            .map(|(full, _, _)| full)
+            .collect();
+        if found.is_empty() {
+            return plain;
+        }
+        plain.extend(found);
+    }
 }
 
 /// `shared: true`, the only `.default` option.
