@@ -442,6 +442,23 @@ module ActionController
       @action_name
     end
 
+    # Rails' `controller_name` / `controller_path`: the demodulized
+    # underscored leaf (`ArticlesController` → `"articles"`) and the
+    # path form that keeps namespaces (`Admin::UsersController` →
+    # `"admin/users"`). Derived from the class name so every controller
+    # answers without a dispatch-time assign.
+    def controller_name
+      leaf = ActiveSupport.demodulize(self.class.to_s)
+      leaf = leaf[0, leaf.length - 10].to_s if leaf.end_with?("Controller")
+      ActiveSupport.underscore(leaf)
+    end
+
+    def controller_path
+      path = self.class.to_s
+      path = path[0, path.length - 10].to_s if path.end_with?("Controller")
+      ActiveSupport.underscore(path)
+    end
+
     # Subclasses override. Error message omits `self.class.name` —
     # `.name`-style reflection forks across targets and the runtime
     # stack trace already identifies the receiver's class.

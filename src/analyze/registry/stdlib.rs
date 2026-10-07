@@ -481,6 +481,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // define these exception classes; emitted requires load them.
         "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",
         "OpenSSL::OpenSSLError", "JSON::ParserError",
+        // Campfire tip: `rescue SystemCallError` / `OpenSSL::SSL::SSLError`
+        // on pooled web-push connections; `rescue Vips::Error` beside
+        // ActiveStorage::PreviewError when drawing attachment variants.
+        "SystemCallError", "OpenSSL::SSL::SSLError", "Vips::Error",
+        // `Timeout.timeout` / `rescue Timeout::Error` — Campfire unfurl
+        // deadline and TimeLimitedVideoPreviewer#capture.
+        "Timeout::Error",
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
     }
@@ -490,9 +497,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActiveRecord::ValueTooLong", None),
         // Not `ActiveRecord::Base`: no instance surface is registered there, so `e.record.errors` would still fail.
         ("ActiveRecord::RecordInvalid", Some(("record", Ty::Untyped))),
+        // Names overlap `project::RUBY_FAMILY_RUNTIME_CONSTANTS` (emit
+        // ledger). Keep extras here — inference needs the readers.
         ("ActionController::ParameterMissing", Some(("param", Ty::Str))),
         ("ActionController::UnpermittedParameters", None),
         ("ActionController::UnknownFormat", None),
+        ("ActionController::RoutingError", Some(("failures", Ty::Array { elem: Box::new(Ty::Str) }))),
     ] {
         let mut methods = exception_surface.to_vec();
         methods.extend(extra);
@@ -504,10 +514,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("cast", Ty::Union { variants: vec![Ty::Bool, Ty::Nil] }),
     ]);
     // Not a typed store: a thread-local slot holds whatever the caller put there, so `[]` answers untyped.
+    // `new` / `pass` / `kill` / `join` — `runtime/ruby/timeout.rb`'s wall-clock
+    // port (Spinel lane) starts a worker and kills it past the deadline.
     let thread = Ty::Class { id: ClassId(Symbol::from("Thread")), args: vec![] };
-    register_stdlib_class(classes, "Thread", &[("current", thread.clone())], &[
+    register_stdlib_class(classes, "Thread", &[
+        ("current", thread.clone()),
+        ("new", thread.clone()),
+        ("pass", Ty::Nil),
+    ], &[
         ("[]", Ty::Untyped),
         ("[]=", Ty::Untyped),
+        ("kill", thread.clone()),
+        ("join", thread.clone()),
     ]);
     // The spinel `csv` package's writer surface: `CSV.generate { |csv| csv << row }` answers the accumulated String.
     let csv = Ty::Class { id: ClassId(Symbol::from("CSV")), args: vec![] };
@@ -576,6 +594,34 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "StringIO", &[], &[
         ("string", Ty::Str), ("<<", string_io),
     ]);
+    // `IO` / `Process` / `Timeout` — Campfire tip names these as Consts
+    // in indexed app source (`time_limited_video_previewer`, web-push
+    // connection pool, unfurl deadline). They were listed in
+    // `RUBY_TOP_LEVEL` (declared-type noise) but never registered, so
+    // Const resolution raised Unsupported. Register the class objects
+    // for Const resolution only. Class-method returns for `Process.*`,
+    // `Timeout.timeout`, and `IO.popen` / `copy_stream` live in the
+    // send special-cases (`body/send.rs`) — catalog entries would win
+    // before those cases and kill unit-aware `clock_gettime` (Float for
+    // `:millisecond`). Nested value Consts (`IO::NULL`,
+    // `Process::CLOCK_MONOTONIC`) are empty ClassIds the way `URI::HTTP`
+    // is. Instance methods on an `IO` handle still belong here.
+    let io = Ty::Class { id: ClassId(Symbol::from("IO")), args: vec![] };
+    register_stdlib_class(classes, "IO", &[], &[
+        ("pid", Ty::Int),
+        ("read", Ty::Str),
+        ("rewind", Ty::Int),
+        ("binmode", io.clone()),
+        ("close", Ty::Nil),
+    ]);
+    register_stdlib_class(classes, "IO::NULL", &[], &[]);
+    register_stdlib_class(classes, "Process", &[], &[]);
+    register_stdlib_class(classes, "Process::CLOCK_MONOTONIC", &[], &[]);
+    register_stdlib_class(classes, "Process::CLOCK_REALTIME", &[], &[]);
+    // Module Const only — `timeout` return is the send special-case.
+    // Exception is `Timeout::Error` above. CRuby loads via BUNDLED
+    // `require "timeout"`; Spinel gets `runtime/ruby/timeout.rb`.
+    register_stdlib_class(classes, "Timeout", &[], &[]);
     // JSON dispatch is already intrinsic in BodyTyper and the emitters;
     // a source-backed reference must also recognize its exact namespace.
     register_stdlib_class(classes, "JSON", &[], &[]);

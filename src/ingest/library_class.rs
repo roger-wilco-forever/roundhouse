@@ -213,6 +213,10 @@ pub(super) fn library_class_and_struct_base(
     full_path.extend(name_path);
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
+    let source_parent_span = class
+        .superclass()
+        .map(|n| super::util::node_span(&n, file))
+        .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
@@ -298,6 +302,13 @@ pub(super) fn library_class_and_struct_base(
             name: owner,
             is_module: false,
             parent,
+            // Struct.new bases replace the source superclass expression;
+            // keep the source span only when the Const parent survived.
+            parent_span: if struct_members.is_some() {
+                Span::synthetic()
+            } else {
+                source_parent_span
+            },
             includes,
             methods,
             nullable_columns: Vec::new(),
@@ -1026,6 +1037,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         name: base,
         is_module: false,
         parent: None,
+        parent_span: Span::synthetic(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
@@ -1065,6 +1077,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         name: owner,
         is_module: true,
         parent: None,
+        parent_span: Span::synthetic(),
         includes,
         methods,
         nullable_columns: Vec::new(),

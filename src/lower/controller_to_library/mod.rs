@@ -552,6 +552,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
             name: controller.name.clone(),
             is_module: false,
             parent: controller.parent.clone(),
+            parent_span: controller.parent_span,
             includes: Vec::new(),
             methods,
             nullable_columns: Vec::new(),
@@ -623,6 +624,7 @@ pub fn lower_controller_to_library_class(controller: &Controller) -> LibraryClas
         name: controller.name.clone(),
         is_module: false,
         parent: controller.parent.clone(),
+        parent_span: controller.parent_span,
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
@@ -882,15 +884,18 @@ fn subclass_template_hooks(
     view_ivars: &ViewIvarMap,
     partials: &PartialMap,
 ) {
-    // (defining controller, stem) for every hook any body called.
-    let mut hooks: Vec<(ClassId, String)> = Vec::new();
-    fn collect(e: &Expr, definer: &ClassId, hooks: &mut Vec<(ClassId, String)>) {
+    // (defining controller, stem, call-site span) for every hook any
+    // body called. The call site keeps the original `render` span from
+    // rewrite (`rewrites.rs`); the definer's raise reuses it so the
+    // availability gate can ledger MissingTemplate instead of skipping
+    // a synthetic Const while emit still writes the throw.
+    let mut hooks: Vec<(ClassId, String, Span)> = Vec::new();
+    fn collect(e: &Expr, definer: &ClassId, hooks: &mut Vec<(ClassId, String, Span)>) {
         if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
             if args.is_empty() {
                 if let Some(stem) = method.as_str().strip_prefix("__template_") {
-                    let key = (definer.clone(), stem.to_string());
-                    if !hooks.contains(&key) {
-                        hooks.push(key);
+                    if !hooks.iter().any(|(d, s, _)| d == definer && s == stem) {
+                        hooks.push((definer.clone(), stem.to_string(), e.span));
                     }
                 }
             }
@@ -902,7 +907,7 @@ fn subclass_template_hooks(
             collect(&m.body, &controller.name, &mut hooks);
         }
     }
-    for (definer, stem) in hooks {
+    for (definer, stem, call_span) in hooks {
         let hook = rewrites::subclass_template_hook_name(&stem);
         // `show_json` → (`show`, `format: :json`); `show` → (`show`, none).
         let (template, format) = match stem.rsplit_once('_') {
@@ -921,18 +926,16 @@ fn subclass_template_hooks(
                 if !is_definer {
                     continue;
                 }
-                let span = Span::synthetic();
+                let span = call_span;
                 Expr::new(
                     span,
                     ExprNode::Raise {
                         value: Expr::new(
                             span,
                             ExprNode::Send {
-                                recv: Some(Expr::new(
+                                recv: Some(rewrites::typed_exception_const(
+                                    &["ActionView", "MissingTemplate"],
                                     span,
-                                    ExprNode::Const {
-                                        path: vec![Symbol::from("ActionView"), Symbol::from("MissingTemplate")],
-                                    },
                                 )),
                                 method: Symbol::from("new"),
                                 args: vec![Expr::new(

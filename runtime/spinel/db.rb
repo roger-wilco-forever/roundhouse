@@ -916,10 +916,10 @@ class DbPool
     # compile-time default nobody had written down.
     #
     # Which is why this is SET rather than left to agree by accident.
-    # The sibling shims (db_cruby.rb, db_jruby.rb) still set nothing and
-    # happen to read NORMAL today; a gem rebuilt with a different
-    # default would move them silently, and that is the shape of bug
-    # this line exists to remove.
+    # The sibling shims (db_cruby.rb, db_jruby.rb) also state
+    # synchronous=NORMAL (and WAL) explicitly; leaving it to the gem's
+    # bundled default would move them silently on a rebuild, and that
+    # is the shape of bug this line exists to remove.
     #
     # The trade is the standard WAL one and worth stating: NORMAL is
     # safe across a process crash and risks only the most recent commits

@@ -832,6 +832,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         name: module_id,
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: vec![method],
         nullable_columns: Vec::new(),

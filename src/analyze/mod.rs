@@ -39,6 +39,7 @@ pub mod mutates_self;
 mod registry;
 mod test_module;
 mod render;
+mod ivar_set;
 mod effects;
 mod diagnostics;
 pub(crate) mod forwarding;
@@ -58,7 +59,7 @@ pub(crate) use body::PARAM_VALUE;
 use render::{
     collect_action_render_views, collect_content_partial_literals,
     collect_dynamic_render_ivars, content_partial_view_name,
-    extract_partial_render_sites, is_partial_view_name,
+    extract_partial_render_sites, is_layout_view_name, is_partial_view_name,
 };
 pub(crate) use body::union_of;
 pub use preload::{missing_preload_report, PreloadCoverage};
@@ -715,6 +716,14 @@ impl Analyzer {
                             .entry((name.clone(), m.name.clone()))
                             .or_insert(Ty::Untyped);
                     }
+                    // Flat `<name>_loaded?` — same Bool `model_to_library`
+                    // synthesizes for emit. Registered here so `check`
+                    // (no post-analyze lower) can type
+                    // `message.boosts.loaded?` via `assoc_loaded_ty`
+                    // without cataloguing Relation `#loaded?`.
+                    cls.instance_methods
+                        .entry(Symbol::from(format!("{}_loaded?", name.as_str())))
+                        .or_insert(Ty::Bool);
                 }
                 cls.instance_methods.insert(name, ty.clone());
                 cls.instance_methods.entry(writer).or_insert(ty);
@@ -752,6 +761,17 @@ impl Analyzer {
                             ModelBodyItem::Association { assoc, .. } => {
                                 let (name, ty) = association_member_ty(assoc);
                                 let writer = Symbol::from(format!("{}=", name.as_str()));
+                                if matches!(
+                                    assoc,
+                                    crate::dialect::Association::HasMany { .. }
+                                ) {
+                                    cls.instance_methods
+                                        .entry(Symbol::from(format!(
+                                            "{}_loaded?",
+                                            name.as_str()
+                                        )))
+                                        .or_insert(Ty::Bool);
+                                }
                                 cls.instance_methods.entry(name).or_insert(ty.clone());
                                 cls.instance_methods.entry(writer).or_insert(ty);
                                 for (name, ty) in association_builder_members(assoc) {
@@ -1880,6 +1900,8 @@ impl Analyzer {
         // this map so `@article.title` in `articles/show.html.erb` types
         // against the `@article` bound in `ArticlesController#show`.
         let mut action_ivars_by_view: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
+        let models_by_ivar =
+            ivar_set::models_by_conventional_ivar(app.models.iter().map(|m| &m.name));
         // Sibling record of the same channel, persisted onto
         // `App::view_feeders`: which controllers feed each view. Filled
         // wherever ivars flow view-ward (action targets below, effective
@@ -2225,16 +2247,13 @@ impl Analyzer {
                 }
             }
 
-            // Snapshot each action's ivar bindings (this controller's
-            // own actions only — parent's actions get layered in by
-            // Phase B's `chained_bindings` builder).
+            // Own-action name keys only — ivar bindings are harvested
+            // once below after `action_bodies` is complete (so
+            // `instance_variable_set "@#{helper}"` can fold sibling
+            // methods). Parent actions are layered in by Phase B.
             let mut action_bindings: HashMap<Symbol, HashMap<Symbol, Ty>> = controller
                 .actions()
-                .map(|a| {
-                    let mut ivars = HashMap::new();
-                    extract_ivar_assignments(&a.body, &mut ivars);
-                    (a.name.clone(), ivars)
-                })
+                .map(|a| (a.name.clone(), HashMap::new()))
                 .collect();
             // Body-carrying twin of `action_bindings` — see the field
             // doc on `ControllerMeta::action_bodies`. Seeded
@@ -2305,25 +2324,19 @@ impl Analyzer {
                         if action_bindings.contains_key(&method.name) {
                             continue;
                         }
+                        // Reserve the name so a later concern cannot
+                        // overwrite; bindings come from the harvest
+                        // below once every body is registered.
+                        action_bindings.entry(method.name.clone()).or_default();
                         let mut body = method.body.clone();
                         self.body_typer().analyze_expr(&mut body, &ctx);
-                        let mut ivars = HashMap::new();
-                        extract_ivar_assignments(&body, &mut ivars);
-                        if !ivars.is_empty() {
-                            action_bindings.insert(method.name.clone(), ivars);
-                        }
-                        // Unconditional, unlike `action_bindings` above: a
-                        // concern method with no DIRECT write of its own
-                        // (`authorize`) still needs its typed body on hand
-                        // as a resolution target for
+                        // Unconditional: a concern method with no DIRECT
+                        // write of its own (`authorize`) still needs its
+                        // typed body as a resolution target for
                         // `collect_transitive_filter_ivars`.
                         action_bodies.entry(method.name.clone()).or_insert_with(|| body.clone());
                     }
                 }
-                self.controller_action_meta_cache.insert(
-                    controller.name.clone(),
-                    (action_bindings.clone(), action_bodies.clone()),
-                );
             } else if let Some((cached_bindings, cached_bodies)) =
                 self.controller_action_meta_cache.get(&controller.name)
             {
@@ -2344,6 +2357,30 @@ impl Analyzer {
                                 .or_insert_with(|| body.clone());
                         }
                     }
+                }
+            }
+
+            // Harvest every method once `action_bodies` holds the full
+            // includer table. `instance_variable_set "@#{helper}"` folds
+            // against sibling methods (`instance_name`) and this
+            // controller's class name.
+            {
+                let env = ivar_set::IvarNameEnv {
+                    self_class: Some(&controller.name),
+                    owned: Some(&action_bodies),
+                    lookup: None,
+                    models_by_ivar: Some(&models_by_ivar),
+                };
+                for (name, body) in &action_bodies {
+                    let mut ivars = HashMap::new();
+                    extract_ivar_assignments_in(body, &mut ivars, &env);
+                    action_bindings.insert(name.clone(), ivars);
+                }
+                if retype {
+                    self.controller_action_meta_cache.insert(
+                        controller.name.clone(),
+                        (action_bindings.clone(), action_bodies.clone()),
+                    );
                 }
             }
 
@@ -2544,6 +2581,32 @@ impl Analyzer {
                 chained_bodies.insert(name.clone(), body);
             }
 
+            // `self.class` in an inherited / mixed-in method is the
+            // receiver class, so re-fold `instance_variable_set` names
+            // against THIS controller. Parent harvest used the class
+            // that wrote `include`, which is the wrong demodulize for
+            // a subclass that only inherits the filter. Replace the
+            // method's map (do not merge): a stale `@leaf_record` from
+            // the parent's class name must not sit beside `@widget`.
+            {
+                let lookup = |n: &Symbol| chained_bodies.get(n).copied();
+                let env = ivar_set::IvarNameEnv {
+                    self_class: Some(&ctrl_name),
+                    owned: None,
+                    lookup: Some(&lookup),
+                    models_by_ivar: Some(&models_by_ivar),
+                };
+                for (name, body) in &chained_bodies {
+                    let mut ivars = HashMap::new();
+                    extract_ivar_assignments_in(body, &mut ivars, &env);
+                    ivars.retain(|_, v| !v.is_open());
+                    if ivars.is_empty() {
+                        continue;
+                    }
+                    chained_bindings.insert(name.clone(), ivars);
+                }
+            }
+
             // Transitive filter-target ivar writes: a Before/Around
             // filter target whose own body writes no ivar directly, but
             // reaches one through its own receiverless calls (Procore's
@@ -2697,9 +2760,15 @@ impl Analyzer {
                 // refinement (a previously Var/absent binding now
                 // carrying shape) triggers the second sweep.
                 let mut refined = false;
+                let env = ivar_set::IvarNameEnv {
+                    self_class: Some(&ctrl_name),
+                    owned: None,
+                    lookup: None,
+                    models_by_ivar: Some(&models_by_ivar),
+                };
                 for action in controller.actions() {
                     let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
-                    extract_ivar_assignments(&action.body, &mut ivars);
+                    extract_ivar_assignments_in(&action.body, &mut ivars, &env);
                     for (k, v) in ivars {
                         if v.is_open() {
                             continue;
@@ -2844,7 +2913,13 @@ impl Analyzer {
             // actions and controllers).
             for action in controller.actions() {
                 let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
-                extract_ivar_assignments(&action.body, &mut ivars);
+                let env = ivar_set::IvarNameEnv {
+                    self_class: Some(&ctrl_name),
+                    owned: None,
+                    lookup: None,
+                    models_by_ivar: Some(&models_by_ivar),
+                };
+                extract_ivar_assignments_in(&action.body, &mut ivars, &env);
                 bind_framework_assigned_ivars(&action.body, &mut ivars);
                 for (filter, _, _) in &chained_filters {
                     if matches!(filter.kind, FilterKind::Before | FilterKind::Around)
@@ -3519,7 +3594,7 @@ impl Analyzer {
     fn type_views_and_tests(&mut self, app: &mut App, global_constants: &body::ConstScope) {
         let ViewSeeds {
             action_ivars_by_view,
-            layout_ivars_by_view,
+            mut layout_ivars_by_view,
             content_partial_ivars,
             mailer_params_by_view,
             mut view_feeders,
@@ -3534,10 +3609,78 @@ impl Analyzer {
         // fixpoint); real-blog's dependency graph is shallow enough to skip.
         let mut partial_locals_by_name: HashMap<Symbol, HashMap<Symbol, Ty>> = HashMap::new();
 
+        // Renderer → partials-it-renders edges, harvested as views are
+        // walked. Drives the ivar propagation below.
+        let mut render_edges: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+
+        let view_ctx_for = |name: &Symbol, ivars: HashMap<Symbol, Ty>| {
+            let mut view_ctx = Ctx::default();
+            view_ctx.in_view = true; // `yield` here renders to a String
+            view_ctx.self_ty = Some(Ty::Class {
+                id: ClassId(Symbol::from("ActionView::Base")),
+                args: vec![],
+            });
+            view_ctx.constants = global_constants.clone();
+            view_ctx.ivar_bindings = ivars;
+            if let Some(row) = mailer_params_by_view.get(name) {
+                view_ctx.local_bindings.insert(Symbol::from("params"), row.clone());
+            }
+            view_ctx
+        };
+
+        // Phase 3a: action / mailer templates first (not layouts). Rails
+        // renders the template, then the layout, in one view context, so
+        // `@section_class = "wide"` in the template is visible in the
+        // layout. Harvest those writes after typing the template and fold
+        // them into the layout seed before layouts are typed.
+        let _typing_views = crate::timings::begin("typing: views");
+        for view in &mut app.views {
+            if is_partial_view_name(&view.name) || is_layout_view_name(&view.name) {
+                continue;
+            }
+            let ivars = action_ivars_by_view
+                .get(&view.name)
+                .cloned()
+                .unwrap_or_default();
+            let view_ctx = view_ctx_for(&view.name, ivars);
+            self.body_typer().analyze_expr(&mut view.body, &view_ctx);
+            let mut assigned = HashMap::new();
+            extract_ivar_assignments(&view.body, &mut assigned);
+            if !assigned.is_empty() {
+                if let Some(feeders) = view_feeders.get(&view.name) {
+                    for feeder in feeders {
+                        let Some(res) = controller_resolutions.get(feeder) else {
+                            continue;
+                        };
+                        let Some(layout_name) = &res.layout else { continue };
+                        let layout_map = layout_ivars_by_view.entry(layout_name.clone()).or_default();
+                        for (k, v) in &assigned {
+                            let noise = |t: &Ty| t.is_unknown();
+                            let merged = match layout_map.remove(k) {
+                                Some(prev) if noise(&prev) => v.clone(),
+                                Some(prev) if noise(v) => prev,
+                                Some(prev) if prev == *v => prev,
+                                Some(prev) => crate::analyze::body::union_of(prev, v.clone()),
+                                None => v.clone(),
+                            };
+                            layout_map.insert(k.clone(), merged);
+                        }
+                    }
+                }
+            }
+            let mut targets = Vec::new();
+            extract_partial_render_sites(
+                &view.body,
+                &view.name,
+                &mut partial_locals_by_name,
+                &mut targets,
+            );
+            record_render_edges(&mut render_edges, &view.name, targets);
+        }
+
         // The ivar context each view carries: action views key by their
-        // own name, layouts fall through to the layout-ivar union. Built
-        // here so it can both seed non-partial views and be propagated to
-        // the partials they render.
+        // own name, layouts fall through to the layout-ivar union (now
+        // including template-assigned ivars).
         let view_ivar_seed = |name: &Symbol| -> HashMap<Symbol, Ty> {
             action_ivars_by_view
                 .get(name)
@@ -3546,39 +3689,11 @@ impl Analyzer {
                 .unwrap_or_default()
         };
 
-        // Renderer → partials-it-renders edges, harvested as views are
-        // walked. Drives the ivar propagation below.
-        let mut render_edges: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
-
-        // Phase 3a: non-partial views (action views + layouts). Analyze with
-        // the controller→view ivar seed, then walk the body to record every
-        // `render` call's effect on partial_locals_by_name.
-        let _typing_views = crate::timings::begin("typing: views");
         for view in &mut app.views {
-            if is_partial_view_name(&view.name) {
+            if !is_layout_view_name(&view.name) {
                 continue;
             }
-            let mut view_ctx = Ctx::default();
-            view_ctx.in_view = true; // `yield` here renders to a String
-            // The view body types against the ActionView context, so
-            // implicit-self helper calls (`form_with`, …) dispatch there.
-            view_ctx.self_ty = Some(Ty::Class {
-                id: ClassId(Symbol::from("ActionView::Base")),
-                args: vec![],
-            });
-            view_ctx.constants = global_constants.clone();
-            // Action views look up by view name (e.g. `articles/show`);
-            // layout views (`layouts/application`) have no matching
-            // action and fall through to the layout-ivar map, which is
-            // the union of every action whose `effective_layout`
-            // resolved to this layout.
-            view_ctx.ivar_bindings = view_ivar_seed(&view.name);
-            // A mailer template's `params` is the mailer's `.with` row
-            // (bound as a local so the bare read wins over the view
-            // context's request-params registration).
-            if let Some(row) = mailer_params_by_view.get(&view.name) {
-                view_ctx.local_bindings.insert(Symbol::from("params"), row.clone());
-            }
+            let view_ctx = view_ctx_for(&view.name, view_ivar_seed(&view.name));
             self.body_typer().analyze_expr(&mut view.body, &view_ctx);
             let mut targets = Vec::new();
             extract_partial_render_sites(
@@ -7341,6 +7456,14 @@ fn ivars_assigned_by_statement(body: &Expr) -> Vec<Symbol> {
 /// body, union-merging repeated assignments. Used by the analyzer's
 /// two-pass library typing and by the Spinel AR RBS probe.
 pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
+    extract_ivar_assignments_in(expr, out, &ivar_set::IvarNameEnv::NONE);
+}
+
+pub(crate) fn extract_ivar_assignments_in(
+    expr: &Expr,
+    out: &mut HashMap<Symbol, Ty>,
+    env: &ivar_set::IvarNameEnv<'_>,
+) {
     match &*expr.node {
         ExprNode::Assign { target: LValue::Ivar { name }, value } => {
             if let Some(ty) = value.ty.clone() {
@@ -7387,7 +7510,7 @@ pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
                     }
                 }
             }
-            extract_ivar_assignments(value, out);
+            extract_ivar_assignments_in(value, out, env);
         }
         // `@hash[k] ||= v` / `@hash[k] = v` in the OpAssign / Assign
         // Index forms (the `||=` accumulator idiom — `@hat_groups[k] ||=
@@ -7402,9 +7525,9 @@ pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
                     widen_hash_ivar_value(out, name, v_ty);
                 }
             }
-            extract_ivar_assignments(recv, out);
-            extract_ivar_assignments(index, out);
-            extract_ivar_assignments(value, out);
+            extract_ivar_assignments_in(recv, out, env);
+            extract_ivar_assignments_in(index, out, env);
+            extract_ivar_assignments_in(value, out, env);
         }
         // `@hash[k] = v` parses as Send to `[]=` with @hash as the
         // receiver. The Hash literal `@hash = {}` only seeds key/value
@@ -7420,41 +7543,46 @@ pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
                     widen_hash_ivar_value(out, name, v_ty);
                 }
             }
-            extract_ivar_assignments(recv, out);
+            extract_ivar_assignments_in(recv, out, env);
             for a in args {
-                extract_ivar_assignments(a, out);
+                extract_ivar_assignments_in(a, out, env);
             }
             if let Some(b) = block {
-                extract_ivar_assignments(b, out);
+                extract_ivar_assignments_in(b, out, env);
             }
         }
         // Walk into other Send forms so nested `[]=` writes (e.g.
         // inside a method-chain receiver or arg expression) still
         // get found. Cheap; the special-case above already handles
         // the widening — this is purely recursive descent.
-        ExprNode::Send { recv, args, block, .. } => {
+        //
+        // `instance_variable_set` is Kernel, not `@ivar =`, so the
+        // Assign arm never sees it. Fold a statically resolvable name
+        // here so the controller→view channel harvests the write.
+        ExprNode::Send { recv, method, args, block, .. } => {
+            ivar_set::harvest_ivar_set(recv, method, args, env, out);
             if let Some(r) = recv {
-                extract_ivar_assignments(r, out);
+                extract_ivar_assignments_in(r, out, env);
             }
             for a in args {
-                extract_ivar_assignments(a, out);
+                extract_ivar_assignments_in(a, out, env);
             }
             if let Some(b) = block {
-                extract_ivar_assignments(b, out);
+                extract_ivar_assignments_in(b, out, env);
             }
         }
         ExprNode::Seq { exprs } => {
             for e in exprs {
-                extract_ivar_assignments(e, out);
+                extract_ivar_assignments_in(e, out, env);
             }
         }
         // The condition is walked too: `if (@message = Model.find(..))`
         // assigns the ivar inside the test, a common `find_*` filter
         // idiom. Without visiting `cond`, that ivar never gets typed.
         ExprNode::If { cond, then_branch, else_branch } => {
-            extract_ivar_assignments(cond, out);
-            extract_ivar_assignments(then_branch, out);
-            extract_ivar_assignments(else_branch, out);
+            extract_ivar_assignments_in(cond, out, env);
+            extract_ivar_assignments_in(then_branch, out, env);
+            extract_ivar_assignments_in(else_branch, out, env);
         }
         // `while cond; body; end` — body may contain `@hash[k] = v`
         // (Parameters' initialize loop). Without this arm, ivar
@@ -7462,16 +7590,16 @@ pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
         // invisible. The condition is walked for the same
         // assignment-in-test reason as `If`.
         ExprNode::While { cond, body, .. } => {
-            extract_ivar_assignments(cond, out);
-            extract_ivar_assignments(body, out);
+            extract_ivar_assignments_in(cond, out, env);
+            extract_ivar_assignments_in(body, out, env);
         }
         ExprNode::RescueModifier { expr, fallback } => {
-            extract_ivar_assignments(expr, out);
-            extract_ivar_assignments(fallback, out);
+            extract_ivar_assignments_in(expr, out, env);
+            extract_ivar_assignments_in(fallback, out, env);
         }
         ExprNode::Case { arms, .. } => {
             for arm in arms {
-                extract_ivar_assignments(&arm.body, out);
+                extract_ivar_assignments_in(&arm.body, out, env);
             }
         }
         // `a && (@x = y)` / `a || (@x = y)` — an ivar assigned inside a
@@ -7479,25 +7607,25 @@ pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
         // so the buried assignment still gets typed. (Compound `@x ||= y`
         // is `OpAssign`, handled by its own arm above — not `BoolOp`.)
         ExprNode::BoolOp { left, right, .. } => {
-            extract_ivar_assignments(left, out);
-            extract_ivar_assignments(right, out);
+            extract_ivar_assignments_in(left, out, env);
+            extract_ivar_assignments_in(right, out, env);
         }
         // Rescue/ensure and lifecycle constructs may also contain
         // assignments; recurse to catch them.
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-            extract_ivar_assignments(body, out);
+            extract_ivar_assignments_in(body, out, env);
             for r in rescues {
-                extract_ivar_assignments(&r.body, out);
+                extract_ivar_assignments_in(&r.body, out, env);
             }
             if let Some(e) = else_branch {
-                extract_ivar_assignments(e, out);
+                extract_ivar_assignments_in(e, out, env);
             }
             if let Some(e) = ensure {
-                extract_ivar_assignments(e, out);
+                extract_ivar_assignments_in(e, out, env);
             }
         }
-        ExprNode::Lambda { body, .. } => extract_ivar_assignments(body, out),
-        ExprNode::Return { value } => extract_ivar_assignments(value, out),
+        ExprNode::Lambda { body, .. } => extract_ivar_assignments_in(body, out, env),
+        ExprNode::Return { value } => extract_ivar_assignments_in(value, out, env),
         // Any other assignment target (local var, constant, attribute) that
         // wasn't matched by the ivar/index arms above. We record no ivar for
         // the target itself, but the RHS can still assign ivars inside a
@@ -7506,13 +7634,13 @@ pub fn extract_ivar_assignments(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
         // Without descending here, those ivars are invisible to the
         // controller→view channel and read as `ivar_unresolved` in the view.
         ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
-            extract_ivar_assignments(value, out);
+            extract_ivar_assignments_in(value, out, env);
         }
         // `let x = <expr with block> in body` — same reasoning as the local
         // assignment above; walk both the bound value and the body.
         ExprNode::Let { value, body, .. } => {
-            extract_ivar_assignments(value, out);
-            extract_ivar_assignments(body, out);
+            extract_ivar_assignments_in(value, out, env);
+            extract_ivar_assignments_in(body, out, env);
         }
         _ => {}
     }

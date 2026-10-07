@@ -599,7 +599,7 @@ pub(super) fn rewrite_render_to_views(
                         value: Expr::new(
                             e.span,
                             ExprNode::Send {
-                                recv: Some(const_path(
+                                recv: Some(typed_exception_const(
                                     &["ActionView", "MissingTemplate"],
                                     e.span,
                                 )),
@@ -2697,6 +2697,19 @@ pub(crate) fn const_path(segments: &[&str], span: Span) -> Expr {
             path: segments.iter().map(|s| Symbol::from(*s)).collect(),
         },
     )
+}
+
+/// Like `const_path`, but stamps `Ty::Class` so the emit-time
+/// ruby-family availability gate sees lowers-added raises
+/// (`MissingTemplate` from a missing `render`).
+pub(crate) fn typed_exception_const(segments: &[&str], span: Span) -> Expr {
+    let name = segments.join("::");
+    let mut expr = const_path(segments, span);
+    expr.ty = Some(crate::ty::Ty::Class {
+        id: crate::ident::ClassId(Symbol::from(name)),
+        args: vec![],
+    });
+    expr
 }
 
 /// True when `e` is a bare `params` send: no receiver, no args, no

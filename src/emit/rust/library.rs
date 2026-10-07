@@ -45,6 +45,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
         name: crate::ident::ClassId(crate::ident::Symbol::from("__emit_module__")),
         is_module: false,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: std::mem::take(&mut colored),
         nullable_columns: Vec::new(),

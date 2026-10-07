@@ -118,6 +118,9 @@ require_relative "runtime/action_controller"
 # chain defines. `multipart` first: `Blob.from_attachable` narrows to
 # the `UploadedFile` it defines.
 require_relative "runtime/multipart"
+# MIME registry — `ActiveStorage.content_type_for_filename` looks up
+# extensions through `Mime::Type` when `attach` omits `content_type:`.
+require_relative "runtime/mime"
 require_relative "runtime/active_storage"
 require_relative "runtime/active_storage_disk"
 # The image processor behind variants: a comment-only stub unless the

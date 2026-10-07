@@ -801,7 +801,7 @@ module ActiveSupport
   end
   # Not ActiveSupport's regex pipeline: without its acronym and human tables the steps it runs are these string walks.
   def self.underscore(text)
-    s = text.to_s
+    s = text.to_s.split("::").join("/")
     out = +""
     n = s.length
     i = 0
@@ -819,6 +819,30 @@ module ActiveSupport
       i = i + 1
     end
     out.downcase
+  end
+
+  # `String#remove(*patterns)` — literal substring delete, not a Regexp
+  # rewrite. Patterns that are not strings are stringified once.
+  def self.remove(text, pattern)
+    text.to_s.split(pattern.to_s).join("")
+  end
+
+  def self.demodulize(text)
+    s = text.to_s
+    idx = s.rindex("::")
+    idx ? s[(idx + 2)..-1].to_s : s
+  end
+
+  # Regular-suffix singularize only. Analyze folds `String#singularize`
+  # into an ivar name only when this answer matches `naming::singularize`
+  # (irregular / uncountable tables); otherwise the ivar stays unresolved.
+  def self.singularize(text)
+    s = text.to_s
+    return s if s.empty?
+    return s[0, s.length - 3].to_s + "y" if s.end_with?("ies") && s.length > 3
+    return s[0, s.length - 2].to_s if s.end_with?("ses") || s.end_with?("xes") || s.end_with?("zes") || s.end_with?("ches") || s.end_with?("shes")
+    return s[0, s.length - 1].to_s if s.end_with?("s") && !s.end_with?("ss")
+    s
   end
 
   def self.humanize(text)

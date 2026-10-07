@@ -319,6 +319,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("find_signed", nilable(class_ty(&blob_id))),
             ("create_and_upload!", class_ty(&blob_id)),
             ("from_attachable", nilable(class_ty(&blob_id))),
+            ("from_io_hash", nilable(class_ty(&blob_id))),
             ("generate_key", Ty::Str),
         ] {
             blob.class_methods.insert(Symbol::from(m), ty);
@@ -396,6 +397,28 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         );
         classes.insert(analyzer_id, analyzer);
 
+        // `ActiveStorage::Previewer` / nested `VideoPreviewer` — the
+        // class-side `poster` is the draw path; the nested class is the
+        // constant apps subclass (campfire's `TimeLimitedVideoPreviewer`).
+        // Both must resolve so inheritance and `previewers` identity
+        // checks type as classes rather than unsupported constants.
+        let previewer_id = ClassId(Symbol::from("ActiveStorage::Previewer"));
+        let mut previewer = ClassInfo::default();
+        previewer.class_methods.insert(Symbol::from("poster"), Ty::Str);
+        classes.insert(previewer_id.clone(), previewer);
+        let mut video_previewer = ClassInfo::default();
+        video_previewer.parent = Some(previewer_id);
+        classes.insert(
+            ClassId(Symbol::from("ActiveStorage::Previewer::VideoPreviewer")),
+            video_previewer,
+        );
+        // Rails' error hierarchy: `PreviewError < Error < StandardError`.
+        let as_error_id = ClassId(Symbol::from("ActiveStorage::Error"));
+        classes.insert(as_error_id.clone(), ClassInfo::default());
+        let mut preview_error = ClassInfo::default();
+        preview_error.parent = Some(as_error_id);
+        classes.insert(ClassId(Symbol::from("ActiveStorage::PreviewError")), preview_error);
+
         // The multipart part a permitted `has_one_attached` field
         // carries (`runtime/spinel/multipart.rbs` verbatim): what the
         // synthesized params class types the field as, and what
@@ -425,6 +448,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             storage.class_methods.insert(Symbol::from(m), Ty::Array { elem: Box::new(Ty::Str) });
         }
         storage.class_methods.insert(Symbol::from("variable_content_type?"), Ty::Bool);
+        storage.class_methods.insert(Symbol::from("content_type_for_format"), Ty::Str);
+        storage.class_methods.insert(Symbol::from("content_type_for_filename"), Ty::Str);
         storage.class_methods.insert(Symbol::from("url_filename"), Ty::Str);
         classes.insert(ClassId(Symbol::from("ActiveStorage")), storage);
     }

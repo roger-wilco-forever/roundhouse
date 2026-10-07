@@ -70,6 +70,12 @@ module ActionController
     def action_name: () -> String
     def assign_action_name: (Symbol name) -> String
 
+    # Rails' demodulized underscored leaf (`ArticlesController` →
+    # `"articles"`) and the path form that keeps namespaces
+    # (`Admin::UsersController` → `"admin/users"`).
+    def controller_name: () -> String
+    def controller_path: () -> String
+
     # `attr_reader` — getter only. Setters are internal (assigned via
     # `@status =`, `@body =`, `@location =` from render/redirect_to/head).
     def status: () -> Integer

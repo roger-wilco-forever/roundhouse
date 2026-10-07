@@ -420,6 +420,10 @@ pub(super) fn ingest_model_with_enum_constants(
         }
     }
 
+    let parent_span = class
+        .superclass()
+        .map(|n| super::util::node_span(&n, file))
+        .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| {
             let resolved = model_bases.resolve_superclass(&scope, &p);
@@ -431,6 +435,7 @@ pub(super) fn ingest_model_with_enum_constants(
     Ok(Some(Model {
         name: owner,
         parent,
+        parent_span,
         sti_subclass_names: Vec::new(),
         table: TableRef(Symbol::from(table_name)),
         primary_key,
