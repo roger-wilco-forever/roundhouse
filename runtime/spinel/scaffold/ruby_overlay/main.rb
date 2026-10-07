@@ -224,7 +224,7 @@ module Main
 
     begin
       controller.process_action(matched.action)
-    rescue ActiveRecord::RecordNotFound
+    rescue ActiveRecord::RecordNotFound, ActionController::RoutingError
       return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     end
 

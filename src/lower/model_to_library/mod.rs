@@ -564,6 +564,7 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
         name: model.name.clone(),
         is_module: false,
         parent: model.parent.clone(),
+        parent_span: Default::default(),
         // Mixins and constants must survive in every model projection.
         includes: crate::analyze::model_includes(model),
         methods,

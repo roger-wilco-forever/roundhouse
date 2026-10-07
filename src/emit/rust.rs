@@ -1142,6 +1142,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     name: ClassId(crate::ident::Symbol::from(struct_name.as_str())),
                     is_module: false,
                     parent: None,
+                    parent_span: Default::default(),
                     includes: Vec::new(),
                     methods: Vec::new(),
                     nullable_columns: Vec::new(),

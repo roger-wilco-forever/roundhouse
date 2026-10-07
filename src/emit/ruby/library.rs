@@ -6036,6 +6036,7 @@ fn synthesize_module_lc(
         name: module_id,
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),

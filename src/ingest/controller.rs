@@ -62,7 +62,7 @@ pub(super) fn ingest_controller_with_nesting(
     // path below has no principled sibling/controller split), and only
     // the empty-body + explicit-superclass shape; anything richer
     // stays dropped as before.
-    let mut sibling_classes: Vec<(Symbol, Symbol)> = Vec::new();
+    let mut sibling_classes: Vec<crate::dialect::SiblingClass> = Vec::new();
     if chosen_idx.is_some() {
         for (i, (scope, _, c)) in all_classes.iter().enumerate() {
             if Some(i) == chosen_idx || !scope.is_empty() {
@@ -75,15 +75,15 @@ pub(super) fn ingest_controller_with_nesting(
                 continue;
             }
             let Some(path) = class_name_path(c) else { continue };
-            let Some(parent_path) =
-                c.superclass().and_then(|n| constant_path_of(&n))
-            else {
+            let Some(super_node) = c.superclass() else { continue };
+            let Some(parent_path) = constant_path_of(&super_node) else {
                 continue;
             };
-            sibling_classes.push((
-                Symbol::from(path.join("::")),
-                Symbol::from(parent_path.join("::")),
-            ));
+            sibling_classes.push(crate::dialect::SiblingClass {
+                name: Symbol::from(path.join("::")),
+                parent: Symbol::from(parent_path.join("::")),
+                parent_span: super::util::node_span(&super_node, file),
+            });
         }
     }
     // Keep the enclosing module scope with the chosen class:
@@ -116,6 +116,10 @@ pub(super) fn ingest_controller_with_nesting(
         message: "controller class name must be a simple constant or path".into(),
     })?);
 
+    let parent_span = class
+        .superclass()
+        .map(|n| super::util::node_span(&n, file))
+        .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
@@ -268,6 +272,7 @@ pub(super) fn ingest_controller_with_nesting(
         Controller {
             name: ClassId(Symbol::from(name_path.join("::"))),
             parent,
+            parent_span,
             body: body_items,
             layout,
             sibling_classes,

@@ -804,6 +804,7 @@ fn module_funcs_to_library_class(
         name: crate::ident::ClassId(crate::ident::Symbol::from(name)),
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),

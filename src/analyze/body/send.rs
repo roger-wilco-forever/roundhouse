@@ -538,6 +538,92 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    /// `message.boosts.loaded?` — Rails AssociationProxy spelling.
+    ///
+    /// The has_many reader types as `Array[Boost]`, which has no
+    /// `loaded?`. Emit lowers the two-hop onto the synthesized
+    /// `boosts_loaded?` Bool (`lower::assoc_loaded`), but `check` /
+    /// LSP analyze without that pass and would otherwise residual the
+    /// tip Campfire view. Mirror the rewrite's admission here: only
+    /// when the owner actually has `<assoc>_loaded?` (has_many was
+    /// synthesized) answer Bool — never catalog Relation `#loaded?`
+    /// (invariant 6: no silent runtime gap).
+    ///
+    /// View locals are often `Untyped`; then fall back to the same
+    /// unique-name rule `assoc_loaded` uses for non-model owners.
+    pub(super) fn assoc_loaded_ty(
+        &self,
+        recv: Option<&crate::expr::Expr>,
+        method: &Symbol,
+    ) -> Option<Ty> {
+        if method.as_str() != "loaded?" {
+            return None;
+        }
+        let ExprNode::Send {
+            recv: Some(owner),
+            method: assoc,
+            args,
+            block: None,
+            ..
+        } = &*recv?.node
+        else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+        let flat = Symbol::from(format!("{}_loaded?", assoc.as_str()));
+        let has_flat = |id: &ClassId| -> bool {
+            let mut current = Some(id);
+            for _ in 0..32 {
+                let Some(cid) = current else { return false };
+                let Some(cls) = self.classes().get(cid) else { return false };
+                if cls.instance_methods.contains_key(&flat) {
+                    return true;
+                }
+                current = cls.parent.as_ref();
+            }
+            false
+        };
+        // Mirror `lower::assoc_loaded::owner_from_typed_recv`: a single
+        // Class admits when it has `<assoc>_loaded?`; a Union admits
+        // only when *every* class alternative does (no first-member
+        // find_map — that would quiet check while emit still refuses).
+        // Typed owners that miss the flat predicate return None — do
+        // not fall through to the unique-name path (that is for
+        // untyped view locals only).
+        match owner.ty.as_ref() {
+            Some(Ty::Class { id, .. }) => {
+                return has_flat(id).then_some(Ty::Bool);
+            }
+            Some(Ty::Union { variants }) => {
+                let ids: Vec<&ClassId> = variants
+                    .iter()
+                    .filter_map(|v| match v {
+                        Ty::Class { id, .. } => Some(id),
+                        _ => None,
+                    })
+                    .collect();
+                return (!ids.is_empty() && ids.iter().all(|id| has_flat(id)))
+                    .then_some(Ty::Bool);
+            }
+            _ => {}
+        }
+        // Untyped / missing owner type (view local): unique `<assoc>_loaded?`
+        // across modeled classes, matching `lower::assoc_loaded`'s
+        // unique-name path for views.
+        let mut found = false;
+        for cls in self.classes().values() {
+            if cls.instance_methods.contains_key(&flat) {
+                if found {
+                    return None;
+                }
+                found = true;
+            }
+        }
+        found.then_some(Ty::Bool)
+    }
+
     pub(super) fn normalize_trailing_kwargs(
         &self,
         recv_ty: Option<&Ty>,
@@ -1301,11 +1387,15 @@ impl<'a> BodyTyper<'a> {
                         _ => {}
                     }
                 }
-                // `Process.pid` — the one Process method the corpus
-                // reaches, and it is Ruby's `Logger::Formatter` that
-                // reaches it: every log line carries `#<pid>`. An
+                // `Process.pid` — Ruby's `Logger::Formatter` and
+                // Campfire's web-push pool (`forget_after_fork`). An
                 // Integer on every target that has a process at all.
                 if id.0.as_str() == "Process" && method.as_str() == "pid" {
+                    return Ty::Int;
+                }
+                // `Process.kill(signal, pid)` — TimeLimitedVideoPreviewer
+                // kills a stuck ffmpeg. Answers the signal as Integer.
+                if id.0.as_str() == "Process" && method.as_str() == "kill" {
                     return Ty::Int;
                 }
                 // `Process.clock_gettime(clock, unit = :float_second)`:
@@ -1320,6 +1410,20 @@ impl<'a> BodyTyper<'a> {
                         }
                         Some(_) => Ty::Untyped,
                     };
+                }
+                // `Timeout.timeout(sec) { ... }` — block result, or raises
+                // Timeout::Error. Campfire unfurl + video previewer.
+                if id.0.as_str() == "Timeout" && method.as_str() == "timeout" {
+                    return Ty::Untyped;
+                }
+                // `IO.popen` / `IO.copy_stream` — capture path; popen is
+                // polymorphic (block vs handle), copy_stream answers bytes.
+                if id.0.as_str() == "IO" {
+                    match method.as_str() {
+                        "popen" => return Ty::Untyped,
+                        "copy_stream" => return Ty::Int,
+                        _ => {}
+                    }
                 }
                 // JSON stdlib — `JSON.generate` and `JSON.dump` return
                 // String; `JSON.parse` / `JSON.load` return parsed

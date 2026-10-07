@@ -53,6 +53,7 @@ fn tiny_blog_round_trips() {
     let post_model = Model {
         name: ClassId(Symbol::from("Post")),
         parent: None,
+        parent_span: Default::default(),
         table: TableRef(Symbol::from("posts")),
         primary_key: None,
         attributes: Row { fields: attrs, rest: None },
@@ -96,6 +97,7 @@ fn tiny_blog_round_trips() {
     let posts_controller = Controller {
         name: ClassId(Symbol::from("PostsController")),
         parent: Some(ClassId(Symbol::from("ApplicationController"))),
+        parent_span: Default::default(),
         body: vec![roundhouse::ControllerBodyItem::Action {
             action: index_action,
             leading_comments: vec![],

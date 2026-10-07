@@ -655,17 +655,17 @@ fn emit_lowered_controllers_from_lcs(
 /// file put them). No-op when the class line isn't found.
 fn prepend_sibling_classes(
     content: &mut String,
-    siblings: &[(crate::ident::Symbol, crate::ident::Symbol)],
+    siblings: &[crate::dialect::SiblingClass],
     class_name: &str,
 ) {
     let marker = format!("class {class_name}");
     let Some(pos) = content.find(&marker) else { return };
     let mut decls = String::new();
-    for (name, parent) in siblings {
+    for sibling in siblings {
         decls.push_str(&format!(
             "class {} < {}; end\n",
-            name.as_str(),
-            parent.as_str()
+            sibling.name.as_str(),
+            sibling.parent.as_str()
         ));
     }
     decls.push('\n');

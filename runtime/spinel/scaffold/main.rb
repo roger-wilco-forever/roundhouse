@@ -506,7 +506,7 @@ module Main
 
     begin
       controller.process_action(matched.action)
-    rescue ActiveRecord::RecordNotFound
+    rescue ActiveRecord::RecordNotFound, ActionController::RoutingError
       res.status = 404
       res.body = "<h1>404 Not Found</h1>"
       return
