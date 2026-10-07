@@ -5,7 +5,7 @@ pub fn overlay() -> super::emit_and_run::Overlay {
     super::emit_and_run::real_blog()
         .write(
             "lib/shop/types.rb",
-            "module Shop\n  module Types\n    include Dry.Types()\n\n    Loud = Types.Constructor(String) do |value|\n      next \"none\" if value.nil?\n\n      value.to_s.upcase\n    end\n  end\nend\n",
+            "module Shop\n  module Types\n    include Dry.Types()\n\n    LABEL = \"shop\"\n    TITLE = Types::LABEL\n\n    Loud = Types.Constructor(String) do |value|\n      next \"none\" if value.nil?\n\n      value.to_s.upcase\n    end\n  end\nend\n",
         )
         .write(
             "lib/shop/base_response.rb",
@@ -91,7 +91,7 @@ end
         )
         .write(
             "lib/shop/delivery.rb",
-            "module Shop\n  class Delivery < Dry::Struct\n    attribute :to do\n      attributes_from Address\n    end\n    attribute? :raw, ::Shop::Types::JSON::Hash\n    attribute :notes?, ::Shop::Types::Array\n    attribute? :volume, ::Shop::Types::Loud\n  end\nend\n",
+            "module Shop\n  class Delivery < Dry::Struct\n    attribute :to do\n      attributes_from Address\n    end\n    attribute? :raw, ::Shop::Types::JSON::Hash\n    attribute :notes?, ::Shop::Types::Array\n    attribute? :volume, ::Shop::Types::Loud\n  end\n\n  class Parcel < Dry::Struct\n    attributes_from ::Shop::Delivery::To\n  end\nend\n",
         )
         .write(
             "lib/shop/tagged.rb",
@@ -112,7 +112,7 @@ end
         )
         .write(
             "lib/shop/kinds.rb",
-            "module Shop\n  module Kinds\n    PAYER = ::Shop::Types.Instance(::Shop::Money) | ::Shop::Types.Instance(::Shop::Refund)\n  end\nend\n",
+            "module Shop\n  module Kinds\n    PAYER = ::Shop::Types.Instance(::Shop::Money) | ::Shop::Types.Instance(::Shop::Refund)\n    LABEL = ::Shop::Types::TITLE\n  end\nend\n",
         )
         .write(
             "lib/shop/client.rb",
@@ -315,6 +315,13 @@ raise "array constructor" unless client.order(base.merge(list: "x")).list == ["x
 d = Shop::Delivery.new(to: { city: "Omsk" }, raw: { "a" => 1 }, volume: :hi)
 raise "attributes_from" unless d.to.city == "Omsk" && d.to.is_a?(Shop::Delivery::To)
 raise "json hash" unless d.raw == { "a" => 1 }
+raise "chained attributes_from" unless Shop::Parcel.new(city: "Kazan").city == "Kazan"
+begin
+  Shop::Parcel.new({})
+  raise "chained attributes_from lost a required key"
+rescue Dry::Struct::Error
+end
+raise "a Types module's value constant was dropped" unless Shop::Kinds::LABEL == "shop"
 raise "name? is omittable" unless d.notes.nil? && Shop::Delivery.new(to: { city: "x" }, notes: [1]).notes == [1]
 raise "types constant constructor" unless d.volume == "HI"
 raise "constructor next" unless Shop::Delivery.new(to: { city: "x" }, volume: nil).volume == "none"

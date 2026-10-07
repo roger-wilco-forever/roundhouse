@@ -291,9 +291,33 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         app.library_classes.extend(error_classes());
         // Nothing left needs dry-types, and the `Types` modules are not
         // emitted: a constant still building a type would fail the load.
+        // The `Types` modules' own constants that build no type, an alias
+        // of one (`ALIAS = Types::LABEL`) included: round by round.
+        let mut plain: HashSet<String> = HashSet::new();
+        loop {
+            let found: Vec<String> = app
+                .library_classes
+                .iter()
+                .filter(|lc| types_modules.iter().any(|(m, _)| m == lc.name.0.as_str()))
+                .flat_map(|lc| {
+                    let holder = lc.name.0.as_str();
+                    lc.constants
+                        .iter()
+                        .map(move |(n, v)| (format!("{holder}::{}", n.as_str()), v, holder))
+                })
+                .filter(|(full, v, holder)| {
+                    !plain.contains(full) && !holds_dry_type(v, holder, &types_modules, &names, &plain)
+                })
+                .map(|(full, _, _)| full)
+                .collect();
+            if found.is_empty() {
+                break;
+            }
+            plain.extend(found);
+        }
         for lc in &mut app.library_classes {
             let holder = lc.name.0.as_str().to_string();
-            lc.constants.retain(|(_, value)| !holds_dry_type(value, &holder, &types_modules, &names));
+            lc.constants.retain(|(_, value)| !holds_dry_type(value, &holder, &types_modules, &names, &plain));
         }
     }
 }
@@ -439,48 +463,57 @@ fn expand_nested(
 /// it stays, and the class is refused for it.
 fn inline_attributes_from(app: &mut App, parent_of: &HashMap<String, Option<String>>) {
     let names: HashSet<String> = app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()).collect();
-    let calls_of = |name: &str| -> Option<Vec<Expr>> {
-        let mut chain = Vec::new();
-        let mut cur = Some(name.to_string());
-        while let Some(n) = cur {
-            chain.push(n.clone());
-            cur = parent_of.get(&n).cloned().flatten();
-        }
-        let mut out = Vec::new();
-        for n in chain.iter().rev() {
-            let lc = app.library_classes.iter().find(|lc| lc.name.0.as_str() == n)?;
-            for call in &lc.unknown_calls {
-                let ExprNode::Send { recv: None, method, .. } = &*call.node else { continue };
-                if matches!(method.as_str(), "attribute" | "attribute?") {
-                    out.push(call.clone());
+    // Sources first, round by round; a cycle is left to refuse.
+    loop {
+        let calls_of = |name: &str| -> Option<Vec<Expr>> {
+            let mut chain = Vec::new();
+            let mut cur = Some(name.to_string());
+            while let Some(n) = cur {
+                chain.push(n.clone());
+                cur = parent_of.get(&n).cloned().flatten();
+            }
+            let mut out = Vec::new();
+            for n in chain.iter().rev() {
+                let lc = app.library_classes.iter().find(|lc| lc.name.0.as_str() == n)?;
+                for call in &lc.unknown_calls {
+                    let ExprNode::Send { recv: None, method, .. } = &*call.node else { continue };
+                    match method.as_str() {
+                        "attribute" | "attribute?" => out.push(call.clone()),
+                        // Not inlined yet: wait for it, so its keys come along.
+                        "attributes_from" => return None,
+                        _ => {}
+                    }
+                }
+            }
+            out.iter().all(absolute_constants).then_some(out)
+        };
+        let mut rewrites: Vec<(usize, usize, Vec<Expr>)> = Vec::new();
+        for (ci, lc) in app.library_classes.iter().enumerate() {
+            let owner = lc.name.0.as_str();
+            if !parent_of.contains_key(owner) {
+                continue;
+            }
+            for (ui, call) in lc.unknown_calls.iter().enumerate() {
+                let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { continue };
+                if method.as_str() != "attributes_from" {
+                    continue;
+                }
+                let [ExprNode::Const { path }] = args.iter().map(|a| &*a.node).collect::<Vec<_>>()[..] else { continue };
+                let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                let Some(source) = resolve_in(owner, &written, &names).filter(|n| parent_of.contains_key(n)) else {
+                    continue;
+                };
+                if let Some(calls) = calls_of(&source) {
+                    rewrites.push((ci, ui, calls));
                 }
             }
         }
-        out.iter().all(absolute_constants).then_some(out)
-    };
-    let mut rewrites: Vec<(usize, usize, Vec<Expr>)> = Vec::new();
-    for (ci, lc) in app.library_classes.iter().enumerate() {
-        let owner = lc.name.0.as_str();
-        if !parent_of.contains_key(owner) {
-            continue;
+        if rewrites.is_empty() {
+            break;
         }
-        for (ui, call) in lc.unknown_calls.iter().enumerate() {
-            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { continue };
-            if method.as_str() != "attributes_from" {
-                continue;
-            }
-            let [ExprNode::Const { path }] = args.iter().map(|a| &*a.node).collect::<Vec<_>>()[..] else { continue };
-            let written = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
-            let Some(source) = resolve_in(owner, &written, &names).filter(|n| parent_of.contains_key(n)) else {
-                continue;
-            };
-            if let Some(calls) = calls_of(&source) {
-                rewrites.push((ci, ui, calls));
-            }
+        for (ci, ui, calls) in rewrites.into_iter().rev() {
+            app.library_classes[ci].unknown_calls.splice(ui..=ui, calls);
         }
-    }
-    for (ci, ui, calls) in rewrites.into_iter().rev() {
-        app.library_classes[ci].unknown_calls.splice(ui..=ui, calls);
     }
 }
 
@@ -951,12 +984,30 @@ fn types_path<'a>(
     types_modules: &[(String, BareNames)],
     names: &HashSet<String>,
 ) -> Option<Vec<&'a str>> {
+    let (_, bare, rest) = types_module_of(path, owner, types_modules, names)?;
+    Some(match (rest.as_slice(), bare) {
+        ([name], _) if *name == "Any" => rest,
+        ([name], BareNames::Strict) => vec!["Strict", name],
+        ([name], BareNames::Nominal) => vec!["Nominal", name],
+        ([name], BareNames::Unknown) => vec!["?", name],
+        _ => rest,
+    })
+}
+
+/// The `Types` module `path` reads, its bare names, and the segments
+/// after it as written.
+fn types_module_of<'a>(
+    path: &'a [Symbol],
+    owner: &str,
+    types_modules: &[(String, BareNames)],
+    names: &HashSet<String>,
+) -> Option<(String, BareNames, Vec<&'a str>)> {
     let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
     let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
     let at = segments.iter().rposition(|s| *s == "Types")?;
     let prefix = segments[..=at].join("::");
     let find = |full: &str| types_modules.iter().find(|(m, _)| m == full);
-    let (_, bare) = if absolute {
+    let (module, bare) = if absolute {
         find(&prefix)?
     } else {
         let mut scope: Vec<&str> = owner.split("::").filter(|s| !s.is_empty()).collect();
@@ -964,6 +1015,19 @@ fn types_path<'a>(
             let candidate =
                 if scope.is_empty() { prefix.clone() } else { format!("{}::{prefix}", scope.join("::")) };
             if let Some(found) = find(&candidate) {
+                // Past the lexical scopes Ruby searches the owner's
+                // ancestors before the top level, and any `X::Types` off
+                // that path may be one of them. Only a different meaning
+                // for bare names matters; that is refused, not guessed.
+                // ponytail: no ancestor walk here; read the ancestry if a
+                // real app nests `Types` modules with differing defaults.
+                if scope.is_empty()
+                    && types_modules.iter().any(|(m, b)| {
+                        *b != found.1 && m.ends_with(&format!("::{prefix}"))
+                    })
+                {
+                    return None;
+                }
                 break found;
             }
             if names.contains(&candidate) || scope.is_empty() {
@@ -972,14 +1036,7 @@ fn types_path<'a>(
             scope.pop();
         }
     };
-    let rest = segments[at + 1..].to_vec();
-    Some(match (rest.as_slice(), bare) {
-        ([name], _) if *name == "Any" => rest,
-        ([name], BareNames::Strict) => vec!["Strict", name],
-        ([name], BareNames::Nominal) => vec!["Nominal", name],
-        ([name], BareNames::Unknown) => vec!["?", name],
-        _ => rest,
-    })
+    Some((module.clone(), *bare, segments[at + 1..].to_vec()))
 }
 
 /// A block body as a method body: its own `next` becomes `return`. A
@@ -1002,17 +1059,20 @@ fn next_to_return(expr: &Expr) -> Expr {
     body
 }
 
-/// Whether `expr` builds a dry type: it reads a `Types` module.
+/// Whether `expr` builds a dry type: it reads a `Types` module, other
+/// than a `plain` constant declared there (`Types::LABEL = "x"`).
 fn holds_dry_type(
     expr: &Expr,
     holder: &str,
     types_modules: &[(String, BareNames)],
     names: &HashSet<String>,
+    plain: &HashSet<String>,
 ) -> bool {
     let own = matches!(&*expr.node, ExprNode::Const { path }
-        if types_path(path, holder, types_modules, names).is_some());
+        if types_module_of(path, holder, types_modules, names)
+            .is_some_and(|(module, _, rest)| !plain.contains(&format!("{module}::{}", rest.join("::")))));
     let mut found = own;
-    expr.node.for_each_child(&mut |c| found |= holds_dry_type(c, holder, types_modules, names));
+    expr.node.for_each_child(&mut |c| found |= holds_dry_type(c, holder, types_modules, names, plain));
     found
 }
 

@@ -344,6 +344,11 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
         ),
         ("lib/shop/piece.rb", "module Shop\n  class Piece < Dry::Struct\n    attribute :id, ::Shop::Types::Coercible::String\n  end\nend\n"),
         ("lib/shop/bulk.rb", "module Shop\n  class Bulk < Dry::Struct\n    attributes(id: ::Shop::Types::Coercible::String)\n  end\nend\n"),
+        ("lib/types.rb", "module Types\n  include Dry.Types()\nend\n"),
+        (
+            "lib/legacy.rb",
+            "class Legacy < Dry::Struct\n  module Types\n    include Dry.Types(default: :nominal)\n  end\nend\n\nclass LegacyChild < Legacy\n  attribute :id, Types::String\nend\n",
+        ),
         ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ]
     .into_iter()
@@ -370,6 +375,9 @@ fn dry_struct_hierarchy_is_lowered_whole_or_not_at_all() {
     assert!(class("Shop::Kept").constants.iter().any(|(n, _)| n.as_str() == "CODE"), "type constant dropped");
     // Unmodeled class DSL refuses rather than being dropped.
     assert_eq!(class("Shop::Bulk").parent.as_ref().map(|p| p.0.as_str()), Some("Dry::Struct"));
+    // `Types::String` in a subclass may be the parent's nominal `Types`,
+    // which Ruby finds before the strict top-level one: refused.
+    assert!(class("LegacyChild").methods.iter().all(|m| m.name.as_str() != "id"), "inherited Types guessed");
 }
 
 /// A Concern macro that writes a `class_attribute` runs when the
