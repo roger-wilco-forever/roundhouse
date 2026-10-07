@@ -2,6 +2,9 @@
 //! One contract for the interpreted and native lanes, checked against
 //! dry-initializer 3.2 with dry-types 1.8.
 
+// Each lane uses only its part.
+#![allow(dead_code)]
+
 pub fn overlay() -> super::emit_and_run::Overlay {
     super::emit_and_run::real_blog()
         .write(
