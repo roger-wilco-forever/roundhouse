@@ -18,6 +18,9 @@ require_relative "action_controller/current"
 # lives in the entry point instead leaves those lists to guess.
 require_relative "message_digest"
 require_relative "action_controller/message_verifier"
+# Masked CSRF tokens + verify. After Current (session) and the
+# digest primitives it consumes.
+require_relative "action_controller/authenticity_token"
 require_relative "action_controller/cookies"
 # The error `Params.require_key` raises; travels with its consumer for
 # the same reason message_digest does.
@@ -32,3 +35,6 @@ require_relative "action_controller/browser_blocker"
 # `rate_limit`'s counter — the window's count against its cap. Called
 # from the filter method the lowering synthesizes.
 require_relative "action_controller/rate_limiter"
+# `invisible_captcha`'s honeypot gate — called from the filter method
+# the lowering synthesizes.
+require_relative "action_controller/invisible_captcha"

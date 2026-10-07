@@ -73,17 +73,22 @@ pub fn emit_method(m: &MethodDef) -> String {
         format!("({})", ps.join(", "))
     };
     let mut out = String::new();
-    if let Some(mk) = source_markers::marker_for(&m.name_span) {
-        writeln!(out, "{mk}").unwrap();
-    }
-    writeln!(out, "def {prefix}{}{}", m.name, params).unwrap();
     // The body's first statement: a Seq writes markers only between
     // its statements, so the first is named here.
     let first = match &*m.body.node {
         crate::expr::ExprNode::Seq { exprs } => exprs.first().unwrap_or(&m.body),
         _ => &m.body,
     };
-    if let Some(mk) = source_markers::marker_for(&first.span) {
+    let body_marker = source_markers::marker_for(&first.span);
+    // A marker ABOVE the def, so the def line never reports the previous
+    // method's held position: Spinel names a --debug backtrace frame by
+    // its def line (spinel#7658). A synthesized method has no name span;
+    // its body's first statement stands in.
+    if let Some(mk) = source_markers::marker_for(&m.name_span).or_else(|| body_marker.clone()) {
+        writeln!(out, "{mk}").unwrap();
+    }
+    writeln!(out, "def {prefix}{}{}", m.name, params).unwrap();
+    if let Some(mk) = body_marker {
         writeln!(out, "{mk}").unwrap();
     }
     let body_text = emit_expr(&m.body);
@@ -213,13 +218,15 @@ pub(crate) fn materialize_models(
         )
         .0,
     );
-    let lcs = crate::lower::model_to_library::lower_models_inner(
+    let lcs = crate::lower::model_to_library::lower_models_inner_with_ruby_values(
         &app.models,
         &app.schema,
         Vec::new(),
         &params_specs,
         &assoc_scopes,
         materialization,
+        crate::lower::model_to_library::FinderInputs::Request,
+        true,
     ).0;
     (lcs, params_specs)
 }
@@ -326,6 +333,11 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // that same cache and would have nothing to prepend itself to if it
     // ran first.
     library::apply_belongs_to_memoization(&mut lcs, app);
+    // Every association reader waits on its record's pending preload
+    // (`lower::deferred_preload`): a Relation's includes run when a record
+    // first reads an association, not when the rows arrive. After the two
+    // passes above, which put the `@<name>_loaded` guard it looks for.
+    crate::lower::deferred_preload::apply(&mut lcs, app);
     // A has_many cache is made on first read rather than at construction,
     // and the constructor's `attrs = {}` default is one shared frozen Hash
     // (`lower::lazy_model_state`) — nine Arrays and a Hash per hydrated
@@ -539,7 +551,7 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
     // + class_info_from_library_class) because the former returns
     // ClassInfo with `table` set — the Arel pass needs `info.table`
     // to map a Const recv to a TableRef when recognizing chains.
-    let (_, model_registry) = crate::lower::lower_models_with_registry(
+    let (_, model_registry) = crate::lower::model_to_library::lower_models_with_request_finders(
         &app.models,
         &app.schema,
         Vec::new(),
@@ -566,6 +578,7 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
         &app.controllers,
         model_extras,
         crate::lower::controller_to_library::LowerControllerOptions {
+            ruby_read_values: true,
             schema: Some(&app.schema),
             views: &app.views,
             library_classes: &app.library_classes,
@@ -991,7 +1004,7 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
         // counted twice, which is worse than not knowing.
         let (model_registry, _dup_diags) = crate::emit::diagnostics::scope(|| {
             let (_, reg) =
-                crate::lower::lower_models_with_registry(&app.models, &app.schema, Vec::new());
+                crate::lower::model_to_library::lower_models_with_request_finders(&app.models, &app.schema, Vec::new());
             reg
         });
         let fixture_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> = fixture_lcs

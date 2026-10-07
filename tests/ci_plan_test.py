@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -397,20 +398,35 @@ class Routing(unittest.TestCase):
             "src/lower/model_to_library/adapter_emit.rs",
             "tests/param_binds.rs",
             "tests/param_binds_emit.rb",
+            "tests/param_binds_raw_where.rb",
             "tests/param_binds_runtime.rb",
+            "tests/param_binds_cruby_cache.rb",
+            "tests/param_binds_spinel_cache.rb",
+            "tests/param_binds_associations.rb",
+            "tests/param_binds_nil.rb",
             "tests/support/emit_and_run.rs",
         ]:
             with self.subTest(path=path):
                 plan = ci.select([path])
-                self.assertEqual(plan["spinel_tests"], ["param_binds"])
+                self.assertEqual(
+                    plan["spinel_tests"],
+                    ci.PARAM_BIND_TESTS if path.startswith("src/") or path == "tests/support/emit_and_run.rs" else ["param_binds"],
+                )
                 self.assertEqual(
                     self.extras(plan), set(ci.CORE) | {"framework-tests-spinel"}
                 )
+        # Generated-read ensure/finalize lives in the Ruby emitter.
+        # Native core already runs for this path; the bind cleanup suite
+        # must too when that file is the only change.
+        self.assertEqual(
+            ci.select(["src/emit/ruby/library.rs"])["spinel_tests"],
+            ci.PARAM_BIND_TESTS,
+        )
         self.assertEqual(
             ci.select(["runtime/spinel/db.rb"])["spinel_tests"],
             [
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
@@ -420,7 +436,7 @@ class Routing(unittest.TestCase):
             [
                 "date_columns_spinel",
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
@@ -433,6 +449,31 @@ class Routing(unittest.TestCase):
         ]:
             with self.subTest(path=path):
                 self.assertNotIn("param_binds", ci.select([path])["spinel_tests"])
+
+    def test_jdbc_probes_select_the_existing_comparison_without_archives(self):
+        for path, native_jobs, suites in [
+            ("tests/support/jdbc_cleanup_failures.rb", set(), []),
+            (
+                "runtime/spinel/test/statement_cache_cases.rb",
+                set(ci.CORE) | {"framework-tests-spinel"},
+                ["param_binds"],
+            ),
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertEqual(self.extras(plan), native_jobs | {"compare-jruby"})
+                self.assertIn("compare-jruby", plan["required"])
+                self.assertEqual(plan["spinel_tests"], suites)
+                self.assertEqual(plan["smoke"], [])
+                self.assertEqual(plan["archives"], [])
+
+    def test_param_bind_suite_drivers_select_their_native_harness(self):
+        for suite in ci.PARAM_BIND_TESTS:
+            for suffix in (".rs", ".rb", "_runtime.rb"):
+                with self.subTest(suite=suite, suffix=suffix):
+                    plan = ci.select(["tests/" + suite + suffix])
+                    self.assertEqual(plan["spinel_tests"], [suite])
+                    self.assertIn("framework-tests-spinel", plan["jobs"])
 
     def test_runtime_owners_choose_asymmetric_focused_binaries(self):
         cases = {
@@ -481,18 +522,18 @@ class Routing(unittest.TestCase):
             "tests/spinel_stmt_cache_lru.rb": ["spinel_stmt_cache_lru"],
             "tests/support/db_concurrency_spinel.rb": ["db_sqlite_concurrency"],
             "runtime/spinel/db.rb": [
-                "spinel_db_lease", "param_binds", "spinel_stmt_cache_lru",
+                "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
             "runtime/spinel/sqlite_adapter.rb": [
                 "date_columns_spinel",
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
             "runtime/spinel/active_support_time_parsing.rb": [
-                "spinel_db_lease", "param_binds", "spinel_stmt_cache_lru",
+                "spinel_db_lease", *ci.PARAM_BIND_TESTS, "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
             "runtime/spinel/date.rb": ["date_columns_spinel"],
@@ -539,7 +580,7 @@ class Routing(unittest.TestCase):
                 "date_columns_spinel",
                 "spinel_web_push_crypto",
                 "spinel_db_lease",
-                "param_binds",
+                *ci.PARAM_BIND_TESTS,
                 "spinel_stmt_cache_lru",
                 "db_sqlite_concurrency",
             ],
@@ -784,6 +825,28 @@ class Results(unittest.TestCase):
         needs = self.needs(owned)
         needs["compare"]["result"] = "failure"
         self.assertTrue(ci.check_results(owned, needs, compact=True)[0])
+
+
+class Workflow(unittest.TestCase):
+    def test_jruby_runs_cleanup_after_runtime_setup(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+        job = re.search(
+            r"(?ms)^  compare-jruby:\n(.*?)(?=^  [\w-]+:|\Z)", workflow
+        )[1]
+        probe = "jruby tests/support/jdbc_cleanup_failures.rb"
+        steps = re.split(r"(?m)^      - ", job)[1:]
+        step = next((s for s in steps if f"          {probe}\n" in s), None)
+        self.assertIsNotNone(step, "compare-jruby must execute the cleanup probe")
+        self.assertNotIn("continue-on-error:", job)
+        self.assertNotIn("\n        if:", step)
+        install = "jruby -S gem install jdbc-sqlite3 --no-document"
+        self.assertIn(f"\n          {install}\n", step)
+        self.assertLess(
+            job.index("java-version: '21'"), job.index("ruby-version: 'jruby-10.0'")
+        )
+        self.assertLess(job.index("ruby-version: 'jruby-10.0'"), job.index(install))
+        self.assertLess(step.index(install), step.index(probe))
+        self.assertLess(job.index(probe), job.index("ruby-version: ${{ env.MRI_RUBY }}"))
 
 
 class MergeTree(unittest.TestCase):

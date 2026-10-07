@@ -796,7 +796,8 @@ fn every_runtime_method_body_concretely_typed() {
     // Soft Bar B ratchet: fails when residual rises. Tighten after a
     // measured drop; never raise without a ledgered feature. Residual
     // still dominated by polymorphic SQL / helper-opt hashes;
-    // `Relation[T]` is the longer-term fix.
+    // `Relation[T]` is the longer-term fix. Merged main's 299; measure
+    // after the security helpers before changing this number.
     const CEILING: usize = 299;
     assert!(
         total_gradual <= CEILING,

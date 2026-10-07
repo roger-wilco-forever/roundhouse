@@ -3,6 +3,233 @@ require_relative "../action_dispatch/session"
 require_relative "../action_view"
 
 module ActionController
+  # One-slot array so class-level CSRF state is a store every target
+  # can index, not a `self` ivar or `class << self` writer.
+  #
+  # Default OFF: extras transpile this file without
+  # `authenticity_token.rb` (empty `masked_authenticity_token` stub),
+  # so fail-closed CSRF turns every POST into 422. The ruby-family
+  # reopen in authenticity_token.rb flips the flag on when the real
+  # masked-token implementation is present. Tests that need the check
+  # set `allow_forgery_protection = true` explicitly.
+  FORGERY_SLOT = [false]
+
+  def self.forgery_flag
+    FORGERY_SLOT[0] == true
+  end
+
+  def self.set_forgery_flag(value)
+    FORGERY_SLOT[0] = value
+  end
+
+  # Empty until `authenticity_token.rb` reopens these: strict-target
+  # emit of this file must not call `Current.session` or XOR bytes.
+  # Strict targets therefore issue no token and check none (see
+  # docs/guide/rails-coverage.md): an empty session secret means
+  # "no minting on this lane," not "fail closed."
+  def self.masked_authenticity_token
+    ""
+  end
+
+  def self.csrf_token_valid?(given, expected)
+    return true if expected.empty?
+    given.length > 0 && given == expected
+  end
+
+  # WHATWG URL-parser preprocessing: drop tab/CR/LF/NUL anywhere, then
+  # strip leading and trailing C0 controls and spaces. A tab in the
+  # middle (`/\t/evil`) becomes `//evil` so host classification sees it.
+  REDIRECT_LINE_BREAKS = { "\r" => "", "\n" => "", "\0" => "", "\t" => "" }.freeze
+  REDIRECT_LINE_BREAK_PATTERN = /[\r\n\0\t]/.freeze
+
+  # Puma's illegal-header rule: drop a key/value that cannot be one
+  # HTTP/1.1 line. Keys scan UTF-8 bytes; values walk characters and
+  # recognize the CRLF grapheme. CRuby/JRuby replace these portable
+  # predicates with regex checks in the target overlay.
+  def self.header_key_ok?(k)
+    return false if k.nil?
+    # Delimiters can share a Swift grapheme with a combining mark. Inspect
+    # their UTF-8 bytes so the policy does not depend on string indexing.
+    bytes = k.bytes
+    n = bytes.length
+    return false if n == 0
+    i = 0
+    while i < n
+      byte = bytes[i]
+      return false if byte <= 32 || byte == 34 || byte == 58 || byte == 127
+      i += 1
+    end
+    true
+  end
+
+  def self.header_value_ok?(v)
+    # Nil is an unset (`headers["X-Rev"] = ENV["GIT_REVISION"]` when
+    # the env is absent). Drop it; do not ask it for length.
+    return false if v.nil?
+    n = v.length
+    i = 0
+    while i < n
+      c = v[i, 1].to_s
+      return false if c != "\t" && header_control?(c)
+      i += 1
+    end
+    true
+  end
+
+  def self.header_control?(c)
+    # Swift strings index grapheme clusters: CRLF can be one element.
+    return true if c == "\r\n"
+    c == "\0" || c == "\r" || c == "\n" || c == "\x01" || c == "\x02" ||
+      c == "\x03" || c == "\x04" || c == "\x05" || c == "\x06" || c == "\x07" ||
+      c == "\x08" || c == "\t" || c == "\x0b" || c == "\x0c" || c == "\x0e" ||
+      c == "\x0f" || c == "\x10" || c == "\x11" || c == "\x12" || c == "\x13" ||
+      c == "\x14" || c == "\x15" || c == "\x16" || c == "\x17" || c == "\x18" ||
+      c == "\x19" || c == "\x1a" || c == "\x1b" || c == "\x1c" || c == "\x1d" ||
+      c == "\x1e" || c == "\x1f" || c == "\x7f"
+  end
+
+  def self.sanitize_location(path)
+    s = path.to_s
+    if s.include?("\r") || s.include?("\n") || s.include?("\0") || s.include?("\t")
+      s = s.gsub(REDIRECT_LINE_BREAK_PATTERN, REDIRECT_LINE_BREAKS)
+    end
+    s = s.tr("\\", "/")
+    # Index-walk strip helpers (one counter while each). Not
+    # `while keep && …` (Elixir BoolOp) and not two whiles in this
+    # method (while_to_recursion allows one top-level while per method).
+    s = strip_leading_controls(s)
+    s = strip_trailing_controls(s)
+    s
+  end
+
+  def self.strip_leading_controls(s)
+    # Index walk — not per-char recursion (stack-safe on long pads).
+    # Canonical counter `while` so Elixir while_to_recursion applies:
+    # early return when a kept char is found; trailing `i += 1` step.
+    n = s.length
+    i = 0
+    while i < n
+      c = s[i, 1].to_s
+      if !(c == " " || header_control?(c))
+        return s[i, n - i].to_s
+      end
+      i += 1
+    end
+    ""
+  end
+
+  def self.strip_trailing_controls(s)
+    n = s.length
+    i = n
+    while i > 0
+      c = s[i - 1, 1].to_s
+      if !(c == " " || header_control?(c))
+        return s[0, i].to_s
+      end
+      i -= 1
+    end
+    ""
+  end
+
+  # Host of an absolute URL (`http://h/path`), or "" when the value is
+  # a relative path. Protocol-relative `//host/...` is a host. A
+  # backslash or interior tab is normalized in `sanitize_location`
+  # first so `/\evil` and `/\t/evil` become `//evil`.
+  def self.location_host(url)
+    s = url.to_s
+    return "" if s.empty?
+    rest = s
+    if s.start_with?("//")
+      rest = s[2, s.length].to_s
+      # `///path` has no host; treat as a dummy host so same-host
+      # refuses it instead of classifying it as relative.
+      return "." if rest.empty? || rest.start_with?("/")
+    else
+      at = find_substr(s, "://")
+      return "" if at < 0
+      rest = s[at + 3, s.length].to_s
+    end
+    slash = find_substr(rest, "/")
+    hostport = slash < 0 ? rest : rest[0, slash].to_s
+    q = find_substr(hostport, "?")
+    hostport = hostport[0, q].to_s unless q < 0
+    hash = find_substr(hostport, "#")
+    hostport = hostport[0, hash].to_s unless hash < 0
+    user = find_last(hostport, "@")
+    hostport = hostport[user + 1, hostport.length].to_s unless user < 0
+    hostport.downcase
+  end
+
+  def self.find_substr(hay, needle)
+    n = needle.length
+    i = 0
+    last = hay.length - n
+    while i <= last
+      return i if hay[i, n].to_s == needle
+      i += 1
+    end
+    -1
+  end
+
+  def self.find_last(hay, needle)
+    n = needle.length
+    i = hay.length - n
+    while i >= 0
+      return i if hay[i, n].to_s == needle
+      i -= 1
+    end
+    -1
+  end
+
+  class HeaderStore
+    def initialize
+      @keys = []
+      @vals = []
+    end
+
+    def [](key)
+      i = 0
+      while i < @keys.length
+        return @vals[i] if @keys[i] == key
+        i += 1
+      end
+      nil
+    end
+
+    # Void: a writer that returns the stored value would leak a
+    # dropped line back to the caller, and rust emit of `[]=` is
+    # `()` not `Option`.
+    def []=(key, value)
+      if ActionController.header_key_ok?(key) && ActionController.header_value_ok?(value)
+        i = 0
+        found = false
+        while i < @keys.length
+          if @keys[i] == key
+            @vals[i] = value
+            found = true
+          end
+          i += 1
+        end
+        unless found
+          @keys << key
+          @vals << value
+        end
+      end
+    end
+
+    def size
+      @keys.length
+    end
+
+    def key_at(i)
+      @keys[i].to_s
+    end
+
+    def val_at(i)
+      @vals[i].to_s
+    end
+  end
+
   # Symbol form (`status: :see_other`) to integer code — Rack's
   # `SYMBOL_TO_STATUS_CODE`, PORTED whole rather than grown entry by
   # entry as apps surfaced them. It used to be "an ad-hoc subset; grow
@@ -95,7 +322,19 @@ module ActionController
   # file would have to satisfy every strict target's type system for
   # a feature none of them exercise yet.
   class Base
+    def self.allow_forgery_protection
+      ActionController.forgery_flag
+    end
+
+    def self.allow_forgery_protection=(value)
+      ActionController.set_forgery_flag(value)
+    end
+
     attr_accessor :params, :session, :flash, :request_method, :request_path, :request_format
+    # Raw query string (no leading `?`), as the request carried it. Path-
+    # option redirects that keep the query read this; dispatchers set it
+    # alongside `request_path` so every target sees the same value.
+    attr_accessor :query_string
     # True when the request's Accept is a bare `*/*` — an
     # XMLHttpRequest or fetch that set none. Rails reads that as "any
     # format", so an action with no html template renders the template
@@ -108,6 +347,9 @@ module ActionController
     # dispatcher assigns it; a `url_for` options hash reads it to fill a
     # segment the hash leaves out, as Rails recalls it.
     attr_accessor :path_parameters
+    # Rails' `action_name`, as a String. The synthesized `process_action`
+    # sets it only in a controller that reads it.
+    attr_reader   :action_name
     attr_reader   :status, :body, :location, :content_type
     # Cache-Control, split into two TYPED readers rather than Rails'
     # one mixed Hash. Rails' `response.cache_control` is
@@ -122,15 +364,19 @@ module ActionController
     def initialize
       @params  = {}
       @path_parameters = {}
+      @action_name = ""
       @session = ActionDispatch::Session.new
       @flash   = ActionDispatch::Flash.new
       @status  = 200
       @body    = +""
       @location = nil
+      @request_method = +""
+      @request_path = +""
       @request_format = :html
+      @query_string = +""
       @accepts_any_format = false
       @content_type = "text/html; charset=utf-8"
-      @headers = {}
+      @headers = ActionController::HeaderStore.new
       @performed = false
       # Set unconditionally, not on first `expires_in`: an ivar a strict
       # target never sees assigned has no type to infer, and the readers
@@ -187,6 +433,15 @@ module ActionController
       @session
     end
 
+    # The dispatcher's seat for `action_name`. The router gives
+    # `process_action` a Symbol, and Rails gives the action a String,
+    # so this method converts it. A framework-only name avoids the
+    # `name=` collision that `assign_http_session` describes.
+    def assign_action_name(name)
+      @action_name = name.to_s
+      @action_name
+    end
+
     # Subclasses override. Error message omits `self.class.name` —
     # `.name`-style reflection forks across targets and the runtime
     # stack trace already identifies the receiver's class.
@@ -208,7 +463,7 @@ module ActionController
       @status = resolve_status(status)
       @performed = true
       @content_type = content_type unless content_type.nil?
-      @location = location unless location.nil?
+      @location = ActionController.sanitize_location(location) unless location.nil?
       nil
     end
 
@@ -216,8 +471,17 @@ module ActionController
     # status; surfaces flash messages via the flash hash. Default
     # status 302 (Found). Real-blog uses 303 (See Other) on
     # PATCH/DELETE responses; pass `status: :see_other` to match.
+    #
+    # CR, LF and NUL are DELETED from the location, as Rails'
+    # `_compute_redirect_to_location` does (`.delete("\0\r\n")`).
+    # An absolute URL whose host is not this request's Host is refused
+    # (`raise_on_open_redirects`): `redirect_to params[:back]` and a
+    # stored `request.url` from a spoofed `HTTP_HOST` must not become
+    # Location on another origin.
     def redirect_to(path, notice: nil, alert: nil, status: :found)
-      @location = path
+      loc = ActionController.sanitize_location(path)
+      loc = same_host_location(loc)
+      @location = loc
       @status   = resolve_status(status)
       @performed = true
       @flash[:notice] = notice unless notice.nil?
@@ -238,7 +502,7 @@ module ActionController
     # on a 3xx status, so setting the location beside a 201 records the
     # URL without turning the response into one.
     def head(status, content_type: nil, location: nil)
-      @location = location unless location.nil?
+      @location = ActionController.sanitize_location(location) unless location.nil?
       @status = resolve_status(status)
       @body   = +""
       @performed = true
@@ -343,7 +607,73 @@ module ActionController
       @body = data
       @content_type = type
       @performed = true
+      disp = disposition.to_s == "inline" ? "inline" : "attachment"
+      @headers["Content-Disposition"] = disp
       nil
+    end
+
+    # Rails' `verify_authenticity_token`: GET/HEAD pass; anything else
+    # must carry a token that unmasks to the session secret, as
+    # `authenticity_token` or `X-CSRF-Token`. An empty session token
+    # matches nothing (fail closed). Tests set
+    # `allow_forgery_protection = false`.
+    #
+    # No trailing `nil`: Elixir's mutation-threaded emit would assign
+    # the `unless`/`render` result to `record` and then discard it,
+    # tripping `--warnings-as-errors` on an unused variable.
+    def verify_authenticity_token
+      unless verified_request?
+        render "<h1>422 Unprocessable Content</h1>", status: :unprocessable_content
+      end
+    end
+
+    def verified_request?
+      return true unless ActionController.forgery_flag
+      verb = @request_method.to_s
+      return true if verb == "" || verb == "GET" || verb == "HEAD"
+      # Nil-then-`to_s` lives in `csrf_session_secret` so the secret is
+      # a typed String at this call (Rust `csrf_token_valid?` takes
+      # `&str`; an Untyped local would pass an owned String).
+      token = params.fetch("authenticity_token", "")
+      return true if ActionController.csrf_token_valid?(token.to_s, csrf_session_secret)
+      ActionController.csrf_token_valid?(csrf_header_token, csrf_session_secret)
+    end
+
+    # Nil-then-`to_s` — not `session[:k].to_s` alone. Strict-target
+    # emit turns a missing key into JS `undefined`, and `String(undefined)`
+    # is `"undefined"`, which would fail closed even when no secret was
+    # minted. The early `nil?` keeps an absent secret as `""` so the
+    # stub `csrf_token_valid?` can check-none; ruby-family
+    # `AuthenticityToken.valid?` still fails closed on empty.
+    # `nil?` / `to_s` stay on the index send: Rust Session `#[]` is
+    # `Option<String>`.
+    def csrf_session_secret
+      return "" if session[:_csrf_token].nil?
+      session[:_csrf_token].to_s
+    end
+
+    def csrf_header_token
+      ""
+    end
+
+    def request_for_csrf
+      nil
+    end
+
+    # Relative locations (`/path`, not `//host`) pass. An absolute URL
+    # must name this request's host; a missing request refuses any host.
+    def same_host_location(loc)
+      host = ActionController.location_host(loc)
+      return loc if host.empty?
+      req_host = request_host_for_redirect
+      if req_host.empty? || host != req_host.downcase
+        raise ArgumentError, "Unsafe redirect to \"" + loc + "\", pass allow_other_host: true to redirect anyway."
+      end
+      loc
+    end
+
+    def request_host_for_redirect
+      ""
     end
 
     # Monomorphic on Symbol — real-blog never passes a literal Integer

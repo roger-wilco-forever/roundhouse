@@ -1332,8 +1332,12 @@ fn lowered_index_view_renders_module_and_method() {
         "expected `def self.index(...)`; got:\n{src}",
     );
     assert!(
-        src.contains("io = String.new"),
-        "expected `io = String.new` prologue; got:\n{src}",
+        src.contains("io = ViewBufferCap.alloc(:cap_Views_Articles_index)"),
+        "expected capacity-hinted ViewBufferCap.alloc prologue; got:\n{src}",
+    );
+    assert!(
+        src.contains("ViewBufferCap.store(:cap_Views_Articles_index, io.bytesize)"),
+        "expected ViewBufferCap.store of last render size; got:\n{src}",
     );
 }
 
@@ -2242,7 +2246,7 @@ fn integer_durations_rewrite_to_duration_calls() {
         "numeric-literal duration rewrites; got:\n{src}",
     );
     assert!(
-        src.contains("ActiveSupport::Duration.days(WINDOW).ago"),
+        src.contains("ActiveSupport::Duration.days(User::WINDOW).ago"),
         "plural duration rewrites even for an (untyped) constant receiver; got:\n{src}",
     );
     assert!(

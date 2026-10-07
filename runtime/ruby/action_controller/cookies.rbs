@@ -19,6 +19,10 @@ module ActionController
     # comment below already says.
     @inbound: Hash[String, String]
     @out: Hash[String, String]
+    @flag_httponly: Hash[String, String]
+    @flag_samesite: Hash[String, String]
+    @flag_secure: Hash[String, String]
+    @flag_expires: Hash[String, String]
 
     def initialize: (?Hash[String, String] inbound) -> void
     def []: (String | Symbol key) -> String
@@ -28,10 +32,17 @@ module ActionController
     # Returning the stored String rather than the argument keeps the
     # return concrete; Ruby's `x[k] = v` evaluates to `v` regardless.
     def []=: (String | Symbol key, untyped value) -> String
-    def permanent: () -> ActionController::CookieJar
+    def permanent: () -> ActionController::PermanentCookieJar
     def signed: () -> ActionController::SignedCookieJar
     def raw: (String | Symbol key) -> String
     def raw_set: (String | Symbol key, untyped value) -> String
+    def record_flags: (String | Symbol key, bool httponly, String | Symbol same_site, bool secure) -> String
+    def flag_httponly?: (String | Symbol key) -> bool
+    def flag_samesite: (String | Symbol key) -> String
+    def flag_secure?: (String | Symbol key) -> bool
+    def record_permanent: (String | Symbol key) -> String
+    def flag_expires: (String | Symbol key) -> String
+    def self.permanent_expires: () -> String
     def delete: (String | Symbol key) -> String
     def pending: () -> Hash[String, String]
     def to_h: () -> Hash[String, String]
@@ -40,13 +51,30 @@ module ActionController
   end
 
   class SignedCookieJar
-    def initialize: (ActionController::CookieJar jar) -> void
+    @jar: ActionController::CookieJar
+    @permanent: bool
+
+    def initialize: (ActionController::CookieJar jar, ?bool permanent) -> void
     # NULLABLE, unlike the unsigned jar's read — see the .rb.
     def []: (String | Symbol key) -> String?
     def []=: (String | Symbol key, untyped value) -> untyped
     def permanent: () -> ActionController::SignedCookieJar
     def delete: (String | Symbol key) -> String
     def self.value_of: (Hash[Symbol, untyped] | String | Integer | Symbol | bool value) -> String
+  end
+
+  class PermanentCookieJar
+    @jar: ActionController::CookieJar
+
+    def initialize: (ActionController::CookieJar jar) -> void
+    def []: (String | Symbol key) -> String
+    # The value union `SignedCookieJar.value_of` already names, not
+    # `untyped`: a new writer must not add to the Bar B residual
+    # (tests/runtime_src_integration.rs), and these are the shapes a
+    # cookie write takes.
+    def []=: (String | Symbol key, Hash[Symbol, untyped] | String | Integer | Symbol | bool value) -> String
+    def signed: () -> ActionController::SignedCookieJar
+    def delete: (String | Symbol key) -> String
   end
 
   class Base

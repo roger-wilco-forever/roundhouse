@@ -766,6 +766,11 @@ module ActiveSupport
     t.getlocal(find_zone!(zone).offset_at(t.to_i))
   end
 
+  # Numeric#in_time_zone: epoch seconds before the zone remapping above.
+  def self.time_at_epoch(n)
+    Time.at(n)
+  end
+
   # Not `Time.local`: under `use_zone` the civil value belongs to that zone, resolved twice to settle an offset change.
   def self.local_time(y, mo, d, h, mi, s, nsec)
     zone = current_zone
@@ -817,6 +822,7 @@ module ActiveSupport
   end
 
   def self.humanize(text)
+    raise NoMethodError, "undefined method 'humanize' for nil" if text.nil?
     s = text.to_s.tr("_", " ").lstrip
     s = s[0, s.length - 3].to_s if s.end_with?(" id")
     s = s.downcase
@@ -825,6 +831,7 @@ module ActiveSupport
   end
 
   def self.titleize(text)
+    raise NoMethodError, "undefined method 'titleize' for nil" if text.nil?
     s = humanize(underscore(text))
     out = +""
     n = s.length

@@ -41,12 +41,13 @@ BASE = [
 # must not fail the Ruby PR floor.
 PUBLICATION = [*BASE, "compare", "browser-smoke-typescript"]
 CORE = ["build-spinel", "toolchain-spinel", "compare-spinel"]
+PARAM_BIND_TESTS = ["param_binds", "param_binds_values", "param_binds_planner", "param_binds_cleanup"]
 SPINEL_TESTS = [
     "date_columns_spinel",
     "framework_tests_spinel",
     "spinel_web_push_crypto",
     "spinel_db_lease",
-    "param_binds",
+    *PARAM_BIND_TESTS,
     "spinel_stmt_cache_lru",
     "db_sqlite_concurrency",
     "spinel_param_builder",
@@ -106,16 +107,29 @@ def native_coverage(path):
         suites.add(focused[1])
     if path == "tests/support/db_concurrency_spinel.rb":
         suites.add("db_sqlite_concurrency")
+    # Gate drivers stay flat beside their Rust harness. Match the most
+    # specific suite first (e.g. param_binds_values before param_binds).
+    if path == "tests/param_binds_text_cleanup.rb":
+        suites.add("param_binds_cleanup")
+    elif path.startswith("tests/") and path.endswith(".rb"):
+        stem = path[len("tests/"):-len(".rb")]
+        for suite in reversed(PARAM_BIND_TESTS):
+            if stem == suite or stem.startswith(suite + "_"):
+                suites.add(suite)
+                break
+    if path == "runtime/spinel/test/statement_cache_cases.rb":
+        suites.add("param_binds")
     if path in {
-        "tests/param_binds_emit.rb",
-        "tests/param_binds_runtime.rb",
         "tests/support/emit_and_run.rs",
         "src/lower/model_to_library/adapter_emit.rs",
-    } or path.startswith("src/lower/arel/"):
-        suites.add("param_binds")
+        "src/emit/ruby/library.rs",
+    } or path.startswith(("src/lower/arel/", "src/lower/model_to_library/adapter_emit/")):
+        suites.update(PARAM_BIND_TESTS)
     if path.startswith(("runtime/spinel/", "runtime/ruby/")) and not interpreter_only:
         name = path.rsplit("/", 1)[-1]
         owned_tests = set()
+        if name == "statement_cache_cases.rb":
+            owned_tests.add("param_binds")
         if any(word in name for word in ("web_push", "base64")):
             owned_tests.add("spinel_web_push_crypto")
         if any(
@@ -137,7 +151,7 @@ def native_coverage(path):
             owned_tests.update(
                 (
                     "spinel_db_lease",
-                    "param_binds",
+                    *PARAM_BIND_TESTS,
                     "spinel_stmt_cache_lru",
                     "db_sqlite_concurrency",
                 )
@@ -250,6 +264,12 @@ def select(
                 spinel_tests.update(SPINEL_TESTS)
             reasons.append(f"{path}: proven {project_scope} assembly bodies only")
             continue
+        if path in {
+            "tests/support/jdbc_cleanup_failures.rb",
+            "runtime/spinel/test/statement_cache_cases.rb",
+        }:
+            targets.add("jruby")
+            reasons.append(f"{path}: JDBC statement lifecycle")
         match = re.match(r"(?:src/emit/|runtime/)([^/.]+)(?:[/.]|$)", path)
         test = re.match(
             r"tests/(?:framework_tests_)?([a-z]+)_toolchain\.rs$|tests/framework_tests_([a-z]+)\.rs$",

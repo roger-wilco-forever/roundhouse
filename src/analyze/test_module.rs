@@ -83,6 +83,16 @@ impl Analyzer {
         None
     }
 
+    /// Retype original test scopes only. View trees stay as the last
+    /// full views/tests pass typed them; helper-chain rounds must not
+    /// walk every template.
+    pub(super) fn type_tests_only(&mut self, app: &mut App) {
+        let (fallback, resolved_values) = self.build_constant_registry(app);
+        self.typed_constants = resolved_values;
+        let global_constants = ConstScope::global(fallback);
+        self.type_test_modules(app, &global_constants);
+    }
+
     pub(super) fn type_test_modules(&self, app: &mut App, constants: &ConstScope) {
         for module in &mut app.test_modules {
             let mut ctx = Ctx {
@@ -116,15 +126,14 @@ impl Analyzer {
                     // Re-seed after typing this default: a dependent default
                     // must see the fresh binding, not last round's default.
                     let name = param.name.clone();
-                    let seeded = self.seed_method_params(&ctx, &module.name, method);
+                    let seeded = self.seed_method_params(&ctx, &module.name, method, false);
                     if let Some(ty) = seeded.local_bindings.get(&name) {
                         default_ctx.local_bindings.insert(name, ty.clone());
                     }
                 }
-                let method_ctx = self.seed_method_params(&ctx, &module.name, method);
+                let method_ctx = self.seed_method_params(&ctx, &module.name, method, false);
                 self.body_typer()
                     .analyze_expr(&mut method.body, &method_ctx);
-                method.effects = self.collect_effects(&mut method.body, &method_ctx);
             }
             for test in &mut module.tests {
                 // Setup's ivars survive, its locals do not. Keep bare source

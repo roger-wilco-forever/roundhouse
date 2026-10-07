@@ -331,7 +331,7 @@ class BaseTest < Minitest::Test
 
   def test_relation_last_page_empty_out_of_range_is_not_last
     it = Item.new; it.title = "A"; it.save()
-    # Page past the end loads empty; Kaminari's last_page? is false there
+    # Page past the end loads empty; last_page? is false there
     # (current_page > total_pages), not true via the short-page shortcut.
     rel = ActiveRecord::Relation.new(Item).order("id").limit(10).offset(10)
     rel.to_a
@@ -490,6 +490,62 @@ class BaseTest < Minitest::Test
     assert_equal 1, rel.count
   end
 
+  def test_group_count_hash_counts_rows_per_group
+    4.times { |i| it = Item.new; it.title = "T#{i % 2}"; it.save() }
+    got = ActiveRecord::Relation.new(Item).group("title").group_count
+    assert_equal 2, got["T0"]
+    assert_equal 2, got["T1"]
+    assert_equal 2, got.length
+  end
+
+  def test_group_count_hash_drops_groups_that_fail_having
+    3.times { |i| it = Item.new; it.title = "T#{i % 2}"; it.save() }
+    rel = ActiveRecord::Relation.new(Item).group("title").having("COUNT(*) > 1")
+    got = rel.group_count
+    assert_equal 2, got["T0"]
+    refute got.key?("T1")
+    assert_equal 1, got.length
+    assert_equal 1, rel.count
+  end
+
+  def test_group_count_distinct_counts_distinct_ids_per_group
+    2.times { it = Item.new; it.title = "T0"; it.save() }
+    rel = ActiveRecord::Relation.new(Item)
+      .joins("INNER JOIN items AS copies ON copies.title = items.title")
+      .group("items.title")
+    assert_equal 4, rel.group_count["T0"]
+    distinct = ActiveRecord::Relation.new(Item)
+      .joins("INNER JOIN items AS copies ON copies.title = items.title")
+      .group("items.title")
+      .distinct
+    assert_equal 2, distinct.group_count["T0"]
+  end
+
+  # HAVING must see the original grouped relation (aggregates / source
+  # columns), not the outer DISTINCT count wrapper.
+  def test_group_count_distinct_having_filters_groups_before_distinct
+    3.times { |i| it = Item.new; it.title = "T#{i % 2}"; it.save() }
+    rel = ActiveRecord::Relation.new(Item)
+      .group("title")
+      .distinct
+      .having("COUNT(*) > 1")
+    got = rel.group_count
+    assert_equal 2, got["T0"]
+    refute got.key?("T1")
+    by_title = ActiveRecord::Relation.new(Item)
+      .group("title")
+      .distinct
+      .having("title = 'T0'")
+    assert_equal({ "T0" => 2 }, by_title.group_count)
+  end
+
+  def test_scalar_count_on_grouped_relation_counts_groups
+    4.times { |i| it = Item.new; it.title = "T#{i % 2}"; it.save() }
+    rel = ActiveRecord::Relation.new(Item).group("title")
+    assert_equal 2, rel.count
+    assert_kind_of Integer, rel.count
+  end
+
   def test_relation_each_does_not_rehydrate_and_returns_self
     it = Item.new; it.title = "A"; it.save()
     rel = ActiveRecord::Relation.new(Item)
@@ -546,6 +602,16 @@ class BaseTest < Minitest::Test
     fork = base.spawn.where(title: "B")
     assert_match(/title = 'B'/, fork.to_sql)
     assert_equal prior, base.to_sql
+    # Copy-on-write: mutating the parent after spawn must not rewrite the fork.
+    base.where(title: "C")
+    assert_match(/title = 'B'/, fork.to_sql)
+    refute_match(/title = 'C'/, fork.to_sql)
+    ordered = ActiveRecord::Relation.new(Item).where(title: "A")
+    prior_order = ordered.to_sql
+    fork_order = ordered.spawn
+    ordered.order!(:id)
+    assert_equal prior_order, fork_order.to_sql
+    assert_match(/ORDER BY/, ordered.to_sql)
   end
 
   def test_find_in_batches_yields_loaded_records_once

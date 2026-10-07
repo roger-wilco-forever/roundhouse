@@ -140,6 +140,24 @@ fn qualified_cross_file_arrays_keep_indices_or_identity_strings() {
 }
 
 #[test]
+fn qualified_cross_file_percent_i_arrays_expand() {
+    use roundhouse::expr::Literal;
+    use roundhouse::Symbol;
+
+    let constants = [(
+        "app/services/ticket_states.rb",
+        "module TicketStates\n  VALUES = %i[draft active]\nend\n",
+    )];
+    let source = "class Ticket < ApplicationRecord\n  enum :state, TicketStates::VALUES.index_with(&:itself)\nend\n";
+    let app = ingest_enum(source, &constants).expect("%i cross-file array");
+    let expected: Vec<_> = ["draft", "active"]
+        .iter()
+        .map(|label| (label.to_string(), Literal::Str { value: label.to_string() }))
+        .collect();
+    assert_eq!(app.models[0].enums.get(&Symbol::from("state")), Some(&expected));
+}
+
+#[test]
 fn qualified_arrays_resolve_lexically_and_absolute_paths_bypass_shadowing() {
     use roundhouse::expr::Literal;
     use roundhouse::Symbol;
@@ -176,7 +194,10 @@ fn a_compound_namespace_does_not_add_its_prefix_to_lexical_lookup() {
 #[test]
 fn nonliteral_or_reassigned_cross_file_inputs_stay_unsupported() {
     let model = "class Ticket < ApplicationRecord\n  enum :state, TicketStates::VALUES.index_with(&:itself)\nend\n";
-    for value in ["build_states", "OTHER", "%w[draft].freeze(1)", "%i[draft active]", "%w[draft].map(&:upcase)"] {
+    // `%i[…]` / symbol arrays are claimed (same labels as class-local
+    // `enum_label_values` / delegated_type concern constants) — see
+    // `qualified_cross_file_percent_i_arrays_expand`.
+    for value in ["build_states", "OTHER", "%w[draft].freeze(1)", "%w[draft].map(&:upcase)"] {
         let source = format!("module TicketStates\n  VALUES = {value}\nend\n");
         assert_enum_gap(model, &[("app/services/ticket_states.rb", &source)]);
     }
@@ -861,14 +882,14 @@ fn late_validation_reports_only_invalid_enum_declarations_under_survey() {
             let result = ingest_enum(&model, &[
                 ("app/services/rating.rb", RATING),
                 ("db/seeds.rb", observation),
-                ("config/routes.rb", "Rails.application.routes.draw do\n  devise_for :users\nend\n"),
+                ("config/routes.rb", "Rails.application.routes.draw do\n  use_doorkeeper\nend\n"),
             ]);
             let gaps = survey::drain();
             result.expect("survey continues while reporting unsupported mappings");
             let (enum_gaps, mut unrelated): (Vec<_>, Vec<_>) = gaps.iter()
                 .map(ToString::to_string).partition(|gap| gap.contains("enum :state mapping"));
             assert_eq!(enum_gaps.len(), expected_enum_gaps, "{gaps:?}");
-            assert!(unrelated.iter().any(|gap| gap.contains("devise_for")), "{gaps:?}");
+            assert!(unrelated.iter().any(|gap| gap.contains("use_doorkeeper")), "{gaps:?}");
             unrelated.sort();
             if let Some(baseline) = &unrelated_baseline {
                 assert_eq!(&unrelated, baseline, "enum validation must not repeat unrelated diagnostics");

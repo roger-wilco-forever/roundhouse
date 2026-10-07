@@ -1045,7 +1045,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// `is_module: true` and `parent: None`. The `is_module` flag is
 /// load-bearing: callers using `include` on the result need it to be
 /// emitted as `module`, not `class`, or Ruby will raise TypeError.
-fn library_class_from_module_node_with_scope(
+pub(super) fn library_class_from_module_node_with_scope(
     module: &ruby_prism::ModuleNode<'_>,
     scope: &[String],
     file: &str,
@@ -1186,7 +1186,7 @@ impl DeclBody {
 /// `include T::Struct::ActsAsComparable` is deliberately NOT here: it
 /// gives a struct its `==`, which is behavior, and it goes when the
 /// struct itself is lowered.
-fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
+pub(super) fn is_sorbet_annotation_mixin(call: &ruby_prism::CallNode<'_>) -> bool {
     let name = call.name();
     if !matches!(constant_id_str(&name), "extend" | "include") {
         return false;
@@ -1232,7 +1232,7 @@ fn constant_path_written(path: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// constructor and a reader, not an annotation, and deleting it would
 /// leave a class that cannot be built. Those need lowering, not
 /// dropping.
-const SORBET_ANNOTATIONS: &[&str] = &[
+pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sig",
     "abstract!",
     "interface!",
@@ -1665,7 +1665,12 @@ fn walk_decl_body_with_visibility<'pr>(
             });
         }
         if let Some(call) = stmt.as_call_node() {
-            if call.receiver().is_none() {
+            // `include X` and `self.include(X)` are the same call: the
+            // explicit-self spelling is how a file that must satisfy a
+            // type checker writes it (`self #: as untyped` on the line
+            // before `.include(Rails.application.routes.url_helpers)`),
+            // and it means the body's own self, exactly as the bare form.
+            if call.receiver().is_none_or(|r| r.as_self_node().is_some()) {
                 let kw = constant_id_str(&call.name());
                 // `class_methods do … end` — ActiveSupport::Concern's
                 // class-side block: its defs become class methods of
@@ -1689,7 +1694,7 @@ fn walk_decl_body_with_visibility<'pr>(
                             // replays it, the rest see a class body they
                             // cannot model.
                             if args.arguments().iter().any(|arg| {
-                                constant_path_of(&arg).is_none() && !is_rails_url_helpers_chain(&arg)
+                                constant_path_of(&arg).is_none() && !crate::ingest::util::is_rails_url_helpers_chain(&arg)
                             }) {
                                 if let Ok(e) = ingest_expr(&stmt, file) {
                                     out.unknown_calls.push(e);
@@ -1711,7 +1716,7 @@ fn walk_decl_body_with_visibility<'pr>(
                                         continue;
                                     }
                                     out.includes.push(ClassId(Symbol::from(path.join("::"))));
-                                } else if is_rails_url_helpers_chain(&arg) {
+                                } else if crate::ingest::util::is_rails_url_helpers_chain(&arg) {
                                     // `include Rails.application.routes.
                                     // url_helpers` (lobsters' Routes class,
                                     // inside `class << self`) — the whole
@@ -1946,35 +1951,6 @@ fn walk_decl_body_with_visibility<'pr>(
     Ok(out)
 }
 
-/// Match the `Rails.application.routes.url_helpers` receiver chain (a
-/// nested CallNode ladder rooted at the `Rails` constant).
-fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
-    let mut expected = ["url_helpers", "routes", "application"].iter();
-    let mut cur = match node.as_call_node() {
-        Some(c) => c,
-        None => return false,
-    };
-    loop {
-        let Some(want) = expected.next() else { return false };
-        if cur.name().as_slice() != want.as_bytes() {
-            return false;
-        }
-        match cur.receiver() {
-            Some(r) => {
-                if let Some(cr) = r.as_constant_read_node() {
-                    return expected.next().is_none()
-                        && cr.name().as_slice() == b"Rails";
-                }
-                match r.as_call_node() {
-                    Some(next) => cur = next,
-                    None => return false,
-                }
-            }
-            None => return false,
-        }
-    }
-}
-
 /// Only declared cattr/mattr reads use the existing class-ivar approximation.
 /// Ordinary class-variable reads retain native shared inheritance storage.
 fn normalize_classvars_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
@@ -2003,7 +1979,7 @@ pub(super) fn alias_keyword_name(node: &ruby_prism::Node<'_>) -> Option<String> 
         .map(|call| constant_id_str(&call.name()).to_string())
 }
 
-fn alias_source(
+pub(super) fn alias_source(
     call: &ruby_prism::CallNode<'_>,
     methods: &[MethodDef],
     class_side: bool,
@@ -2285,15 +2261,18 @@ pub(super) fn ingest_library_method(
     // `&block` rides in `MethodDef.block_param`, not the flat list —
     // it occupies the call-site `block:` slot, never `args:`. Mirrors
     // the runtime_src split (see runtime_src::method_params).
-    let block_param = def.parameters().and_then(|pn| pn.block()).map(|block| {
-        let name = block
-            .name()
-            .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
-            // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
-            // name so body-side bare-`&` forwarding (`__blk`) binds.
-            .unwrap_or("__blk");
-        Param::positional(Symbol::from(name))
-    });
+    let block_param = def
+        .parameters()
+        .and_then(|pn| pn.block())
+        .map(|block| {
+            let name = block
+                .name()
+                .and_then(|loc| std::str::from_utf8(loc.as_slice()).ok())
+                // Ruby 3.4 anonymous block param (`def f(&)`) — synthesize a
+                // name so body-side bare-`&` forwarding (`__blk`) binds.
+                .unwrap_or("__blk");
+            Param::positional(Symbol::from(name))
+        });
 
     let body = match def.body() {
         Some(b) => ingest_expr(&b, file)?,
@@ -3075,8 +3054,10 @@ fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
 /// classifier doesn't claim, and most of what lands there really does
 /// belong to the module rather than to its includers.
 const CONCERN_MODEL_MACROS: &[&str] = &[
+    "generates_token_for",
     "has_one_attached",
     "has_rich_text",
+    "has_markdown",
     "has_secure_token",
     "has_secure_password",
     "has_json",
@@ -3099,13 +3080,17 @@ fn unknown_is_model_macro(item: &crate::dialect::ModelBodyItem) -> bool {
     CONCERN_MODEL_MACROS.contains(&method.as_str())
 }
 
+/// Re-export: table payload lives next to [`super::model::EnumExpansion`].
+pub use super::model::ConcernEnumDecl;
+
 /// Second return value: `enum` columns declared inside an `included
 /// do`, keyed by the concern module. They belong to every includer
 /// exactly as the DSL items do; the splice folds them into each
-/// including model's own `enums` table.
+/// including model's own `enums` table (and `enum_defaults` when
+/// `default:` is present).
 pub type ConcernModelItems = (
     Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)>,
-    Vec<(ClassId, Vec<(Symbol, Vec<(String, crate::expr::Literal)>)>)>,
+    Vec<(ClassId, Vec<ConcernEnumDecl>)>,
 );
 
 fn walk_dsl_stmts<'pr>(body: ruby_prism::Node<'pr>, out: &mut Vec<ruby_prism::Node<'pr>>) {
@@ -3133,13 +3118,24 @@ pub(super) fn included_has_accessor(body: ruby_prism::Node<'_>, owner: &ClassId,
     walk_dsl_stmts(body, &mut stmts);
     super::survey::without_recording(|| {
         stmts.iter().any(|stmt| {
-            super::model::ingest_model_body_items(stmt, owner, file, Vec::new())
+            super::model::ingest_model_body_items(stmt, owner, file, Vec::new(), None)
                 .is_ok_and(|items| items.iter().any(super::concern_accessors::is_candidate))
         })
     })
 }
 
 pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItems {
+    ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default())
+}
+
+/// Same as [`ingest_concern_model_items`], with the app-wide constant
+/// table so `types: Leafable::TYPES` / bare `TYPES` inside `included do`
+/// resolve the way model-side class-body DSL does.
+pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
+    source: &[u8],
+    file: &str,
+    enum_constants: &super::model::EnumConstants,
+) -> ConcernModelItems {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
 
@@ -3152,10 +3148,18 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
         let mut full_path: Vec<String> = scope.clone();
         full_path.extend(name_path);
         let id = ClassId(Symbol::from(full_path.join("::")));
+        let enum_owners = enum_constants
+            .nesting
+            .get(&(file.to_string(), module.location().start_offset()))
+            .cloned()
+            .unwrap_or_default();
+        let resolve_constant = |node: &ruby_prism::Node<'_>| {
+            enum_constants.resolve(node, &enum_owners)
+        };
 
         let Some(body) = module.body() else { continue };
         let mut items: Vec<ModelBodyItem> = Vec::new();
-        let mut enums: Vec<(Symbol, Vec<(String, crate::expr::Literal)>)> = Vec::new();
+        let mut enums: Vec<ConcernEnumDecl> = Vec::new();
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
             if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
@@ -3175,11 +3179,25 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // User::Role. Expanded here for the same reason the
                 // model walk expands it: one statement, many items.
                 if let Some(call) = inner.as_call_node() {
-                    match super::model::expand_enum_decl(
-                        &call, file, &[], &|_| None,
+                    match super::model::expand_class_body_dsl(
+                        &call,
+                        file,
+                        &[],
+                        &super::model::ClassConsts::default(),
+                        &resolve_constant,
                     ) {
-                        Ok(Some(expanded)) => {
-                            enums.push((expanded.column, expanded.mapping));
+                        Ok(Some(super::model::ClassBodyExpansion::DelegatedType(expanded))) => {
+                            items.extend(expanded);
+                            continue;
+                        }
+                        Ok(Some(super::model::ClassBodyExpansion::Enum(expanded))) => {
+                            if let Some(mapping) = expanded.mapping {
+                                enums.push(ConcernEnumDecl {
+                                    column: expanded.column,
+                                    mapping,
+                                    default: expanded.default,
+                                });
+                            }
                             items.extend(expanded.items);
                             continue;
                         }
@@ -3196,7 +3214,7 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
-                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new()) {
+                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
                         for mut item in parsed {
                             match item {

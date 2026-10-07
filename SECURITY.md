@@ -11,7 +11,7 @@ from everyone.
 - If you have Hardening ideas, found a weakness in tooling or low level
   vulnerability, please open a public issue or pull request as usual.
 - If you found a high level security issue that could be used to exploit a
-  compiled app and cause serious damage, please report privately throigh
+  compiled app and cause serious damage, please report privately through
   [GitHub's private vulnerability
   reporting](https://github.com/rubys/roundhouse/security/advisories/new).
   Please include reproduction steps and the targets you checked and if you

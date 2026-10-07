@@ -132,6 +132,8 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         span: Span::synthetic(),
         enums: indexmap::IndexMap::new(),
         enum_defaults: indexmap::IndexMap::new(),
+        class_attr_defaults: indexmap::IndexMap::new(),
+        lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
     });
     let models_dir = dir.join("models");
@@ -805,7 +807,10 @@ impl<'f> RouteWalker<'f> {
         let mut entries: Vec<RouteSpec> = Vec::new();
         for leaf in &leaves {
             if leaf.is_root {
-                entries.push(RouteSpec::Root { target: "root#index".to_string() });
+                entries.push(RouteSpec::Root {
+                    target: "root#index".to_string(),
+                    as_name: None,
+                });
                 continue;
             }
             let controller_stem = leaf.controller.clone().unwrap_or_else(|| "root".into());
@@ -829,7 +834,7 @@ impl<'f> RouteWalker<'f> {
                 scope: Default::default(),
             });
         }
-        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new() };
+        app.routes = RouteTable { entries, direct_helpers: Vec::new(), redirects: Vec::new(), diagnostics: Vec::new() };
 
         // Controllers — group leaves by controller stem, first-seen
         // order.

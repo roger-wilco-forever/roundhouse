@@ -617,9 +617,15 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
         // than a `__scope_` hop to a body that returns its argument;
         // leaving them here would make `by_name` claim them and the
         // identity arm skip them as "a declared scope of the same name".
+        let plain_preload = if crate::lower::plain_text_attr::record_table_present(&app.schema) {
+            crate::lower::plain_text_attr::preload_scope_names(model)
+        } else {
+            Vec::new()
+        };
         let synthesized: std::collections::HashSet<String> =
             crate::lower::rich_text::preload_scope_names(model)
                 .into_iter()
+                .chain(plain_preload)
                 .chain(crate::lower::attached::preload_scope_names(model))
                 .map(|n| n.as_str().to_string())
                 .collect();
@@ -635,13 +641,13 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
                 .push((&model.name, per[n].as_slice()));
         }
     }
-    // The SYNTHESIZED preload scopes — `with_attached_<attr>` and
-    // `with_rich_text_<attr>` — which Rails declares beside the
-    // attachment macro and this compiler adds at emit time
-    // (`attached::push_preload_scope_methods` and its rich-text twin).
-    // They never pass through `build_scope_registry`, which reads the
-    // app's own `scope` declarations, so a call CHAINED ON A RELATION
-    // had no delegate at all: campfire's
+    // The SYNTHESIZED preload scopes — `with_attached_<attr>`,
+    // `with_rich_text_<attr>`, `with_markdown_<attr>` — which Rails
+    // declares beside the attachment / Action Text macros and this
+    // compiler adds at emit time. They never pass through
+    // `build_scope_registry`, which reads the app's own `scope`
+    // declarations, so a call CHAINED ON A RELATION had no delegate at
+    // all: campfire's
     // `find_autocompletable_users.with_attached_avatar.ordered` is a
     // NoMethodError on a class method that plainly exists, because the
     // receiver is a relation value and not the class.
@@ -649,16 +655,22 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
     // The delegate is `preload(:<assoc>)`, with no `__scope_` dispatch
     // behind it: there is no arity to detect and no model to pick,
     // because every model that declares the attachment preloads the
-    // same named association (`<attr>_attachment`, `rich_text_<attr>`),
-    // and a model that does not never has the name reached on it. It
-    // used to answer `self` — the scopes were identity while the
-    // readers queried per record — and a delegate that preloads is
-    // what lets the batch loader run when the scope is reached
-    // mid-chain, not only from the class.
+    // same named association (`<attr>_attachment`, `rich_text_<attr>`,
+    // `markdown_<attr>`), and a model that does not never has the name
+    // reached on it. It used to answer `self` — the scopes were
+    // identity while the readers queried per record — and a delegate
+    // that preloads is what lets the batch loader run when the scope is
+    // reached mid-chain, not only from the class.
     let mut preloads: std::collections::BTreeMap<String, String> = Default::default();
     for model in &app.models {
+        let plain_scopes = if crate::lower::plain_text_attr::record_table_present(&app.schema) {
+            crate::lower::plain_text_attr::preload_scopes(model)
+        } else {
+            Vec::new()
+        };
         let scopes = crate::lower::rich_text::preload_scopes(model)
             .into_iter()
+            .chain(plain_scopes)
             .chain(crate::lower::attached::preload_scopes(model));
         for (n, assoc) in scopes {
             let n = n.as_str().to_string();
@@ -1132,11 +1144,12 @@ fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol) -> bo
 /// Lower demanded model and association chains to Relations, including
 /// scope-free apps; each body still has its own rewrite demand gate.
 pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
-    // `has_rich_text`'s two preload scopes, and `has_one_attached`'s
-    // one. Ahead of the `any_scopes` early return below, because an app
-    // can declare a rich-text attribute or an attachment and no `scope`
-    // at all — and these still have to exist or every call site
-    // chaining through them is a NoMethodError.
+    // `has_rich_text` / `has_markdown` preload scopes, and
+    // `has_one_attached`'s one. Ahead of the `any_scopes` early return
+    // below, because an app can declare a rich-text / plain-text
+    // attribute or an attachment and no `scope` at all — and these
+    // still have to exist or every call site chaining through them is
+    // a NoMethodError.
     // `attachable_sgid` for the models that mix in
     // `ActionText::Attachable` (campfire declares it one level down,
     // through `User::Mentionable`). Ruby-family only, like the
@@ -1145,6 +1158,9 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     for lc in lcs.iter_mut() {
         if let Some(model) = app.models.iter().find(|m| m.name == lc.name) {
             crate::lower::rich_text::push_preload_scope_methods(&mut lc.methods, model);
+            if crate::lower::plain_text_attr::record_table_present(&app.schema) {
+                crate::lower::plain_text_attr::push_preload_scope_methods(&mut lc.methods, model);
+            }
             crate::lower::attached::push_preload_scope_methods(&mut lc.methods, model);
             crate::lower::attachable::push_attachable_sgid(&mut lc.methods, model, &attachable);
             crate::lower::broadcasts::push_to_gid_param(&mut lc.methods, model);
@@ -5198,6 +5214,29 @@ pub(crate) fn apply_hydration_nil_lowering(lcs: &mut [LibraryClass], app: &App) 
         if let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) {
             for m in &mut lc.methods {
                 widen_fk_zero_guards(&mut m.body, &nullable_fks);
+                // Polymorphic readers dispatch on the type discriminator,
+                // so they have no zero-sentinel guard to widen. Guard their
+                // nullable FK here too, before any key-typed adapter call.
+                if m.name_span.is_synthetic() {
+                    for assoc in model.associations() {
+                        if let crate::dialect::Association::BelongsTo {
+                            name, foreign_key, polymorphic: true, ..
+                        } = assoc {
+                            if m.name == *name && nullable.contains(foreign_key) {
+                                let cond = Expr::new(Span::synthetic(), ExprNode::Send {
+                                    recv: Some(Expr::new(Span::synthetic(), ExprNode::Ivar { name: foreign_key.clone() })),
+                                    method: Symbol::from("nil?"), args: vec![], block: None,
+                                    parenthesized: false,
+                                });
+                                m.body = Expr::new(m.body.span, ExprNode::If {
+                                    cond,
+                                    then_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+                                    else_branch: m.body.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -5276,10 +5315,8 @@ fn widen_fk_zero_guards(expr: &mut Expr, fks: &BTreeSet<Symbol>) {
             if method.as_str() == "==" && args.len() == 1 =>
         {
             matches!(&*r.node, ExprNode::Ivar { name } if fks.contains(name))
-                && matches!(
-                    &*args[0].node,
-                    ExprNode::Lit { value: Literal::Int { value: 0 } }
-                )
+                && (matches!(&*args[0].node, ExprNode::Lit { value: Literal::Int { value: 0 } })
+                    || matches!(&*args[0].node, ExprNode::Lit { value: Literal::Str { value } } if value.is_empty()))
         }
         _ => false,
     };
@@ -5835,6 +5872,67 @@ pub(super) fn emit_library_class_pair_with_synthesized(
     vec![rb, rbs]
 }
 
+/// A lowered read owns its statement from prepare until finalize, including
+/// argument serialization and row hydration. Release within that scope even
+/// when the caller rescues inside a longer connection lease. This Ruby-only
+/// pass leaves strict-target IR unchanged and covers reloads and preloads too.
+fn read_statement_cleanup(lc: &LibraryClass) -> std::borrow::Cow<'_, LibraryClass> {
+    fn db_send(expr: &Expr, name: &str) -> bool {
+        matches!(&*expr.node, ExprNode::Send { recv: Some(recv), method, .. }
+            if method.as_str() == name && matches!(&*recv.node,
+                ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Db"))
+    }
+    fn prepare(expr: &Expr) -> bool {
+        db_send(expr, "prepare") || db_send(expr, "prepare_uncached")
+    }
+    fn prepared_name(expr: &Expr) -> Option<&Symbol> {
+        match &*expr.node {
+            ExprNode::Assign { target: LValue::Var { name, .. }, value } if prepare(value) => Some(name),
+            _ => None,
+        }
+    }
+    fn finalize(expr: &Expr, name: &Symbol) -> bool {
+        db_send(expr, "finalize") && matches!(&*expr.node,
+            ExprNode::Send { args, .. } if args.len() == 1
+                && matches!(&*args[0].node, ExprNode::Var { name: actual, .. } if actual == name))
+    }
+    fn needs_cleanup(expr: &Expr) -> bool {
+        let mut found = prepared_name(expr).is_some();
+        expr.node.for_each_child(&mut |child| found |= needs_cleanup(child));
+        found
+    }
+    fn rewrite(expr: &mut Expr) {
+        expr.node.for_each_child_mut(&mut rewrite);
+        let ExprNode::Seq { exprs } = expr.node.as_mut() else { return };
+        let mut start = 0;
+        while start < exprs.len() {
+            if let Some(name) = prepared_name(&exprs[start]) {
+                if let Some(end) = (start + 1..exprs.len()).find(|&i| finalize(&exprs[i], name)) {
+                    let mut work: Vec<_> = exprs.drain(start + 1..=end).collect();
+                    let cleanup = work.pop().unwrap();
+                    let body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: work });
+                    exprs.insert(start + 1, Expr::new(Span::synthetic(), ExprNode::BeginRescue {
+                        body,
+                        rescues: vec![],
+                        else_branch: None,
+                        ensure: Some(cleanup),
+                        implicit: false,
+                    }));
+                }
+            }
+            start += 1;
+        }
+    }
+    if !lc.methods.iter().any(|m| needs_cleanup(&m.body)) {
+        return std::borrow::Cow::Borrowed(lc);
+    }
+    let mut adapted = lc.clone();
+    for method in &mut adapted.methods {
+        rewrite(&mut method.body);
+    }
+    std::borrow::Cow::Owned(adapted)
+}
+
 /// Emit a group of LibraryFunctions sharing a `module_path` as a
 /// single Ruby file. Mirrors `typescript::library::emit_module_file`
 /// — converts the function group into a synthetic
@@ -5985,6 +6083,8 @@ pub(super) fn emit_library_class_decl_with_synthesized(
     out_path: PathBuf,
     synthesized_siblings: &[(String, String)],
 ) -> EmittedFile {
+    let guarded = read_statement_cleanup(lc);
+    let lc = guarded.as_ref();
     // The one chokepoint every library-shape file goes through, and the
     // only place that knows which class is being emitted — the send
     // emitter is a free function reached from a dozen callers. A reopen
@@ -6368,15 +6468,6 @@ fn emit_library_class_decl_inner(
         }
     }
 
-    // Finite class-side initialization is lowered IR, not replay of a
-    // framework DSL. Each assignment runs once on this class object;
-    // unset subclasses deliberately keep their ivar absent.
-    for init in &lc.class_ivar_initializers {
-        for line in super::emit_expr(init).lines() {
-            writeln!(s, "{body_pad}{line}").unwrap();
-        }
-    }
-
     let mut first = true;
     for m in &lc.methods {
         if !first {
@@ -6413,6 +6504,19 @@ fn emit_library_class_decl_inner(
         };
         if let Some(directive) = directive {
             writeln!(s, "{body_pad}{directive} :{}", m.name).unwrap();
+        }
+    }
+
+    // Finite class-side initialization is lowered IR, not replay of a
+    // framework DSL. Each statement runs once on this class object, after
+    // the class methods it may call (a Concern macro writing its
+    // `class_attribute`); unset subclasses keep their ivar absent.
+    if !lc.class_ivar_initializers.is_empty() && !lc.methods.is_empty() {
+        writeln!(s).unwrap();
+    }
+    for init in &lc.class_ivar_initializers {
+        for line in super::emit_expr(init).lines() {
+            writeln!(s, "{body_pad}{line}").unwrap();
         }
     }
 
@@ -6504,6 +6608,30 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         let ExprNode::Const { path } = &*r.node else { return false };
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::") == class_name
     }
+    /// Does this Const name a constant already marked deferred — bare
+    /// `BUILTIN`, or `OwnClass::BUILTIN` (qualified by a later rewrite)?
+    fn const_names_deferred(
+        path: &[crate::ident::Symbol],
+        deferred_names: &std::collections::HashSet<String>,
+        class_name: &str,
+    ) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        if path.len() == 1 {
+            return deferred_names.contains(path[0].as_str());
+        }
+        let leaf = path[path.len() - 1].as_str();
+        if !deferred_names.contains(leaf) {
+            return false;
+        }
+        let prefix = path[..path.len() - 1]
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        prefix == class_name
+    }
     fn calls_self(expr: &Expr, own: &std::collections::HashSet<&str>, deferred_names: &std::collections::HashSet<String>, class_name: &str) -> bool {
         match &*expr.node {
             // A closure that is STORED rather than run — `proc { … }`,
@@ -6545,9 +6673,12 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
                             _ => calls_self(b, own, deferred_names, class_name),
                         }))
             }
-            ExprNode::Const { path }
-                if path.len() == 1 && deferred_names.contains(path[0].as_str()) =>
-            {
+            // Bare `BUILTIN` *and* `Sound::BUILTIN` — index_by grounding
+            // (and similar) rewrites the receiver to the qualified form,
+            // and a rule that only matched path.len() == 1 left INDEX
+            // eager while BUILTIN deferred: `uninitialized constant
+            // Sound::BUILTIN` at load (campfire models.rb → sound.rb).
+            ExprNode::Const { path } if const_names_deferred(path, deferred_names, class_name) => {
                 true
             }
             _ => {
@@ -6946,6 +7077,9 @@ fn require_path_for_body_const(
     // body to need this: `created_at: <%= 1.hour.ago %>` grounds to
     // `ActiveSupport::Duration.hour(1)` and `test/fixtures/<x>.rb` is
     // reached from the test harness, not from main.rb's require chain.
+    if joined == "ActiveSupport::SecurityUtils" {
+        return Some("runtime/security_utils".to_string());
+    }
     if joined == "ActiveSupport::Duration" {
         return Some("runtime/active_support_duration".to_string());
     }
@@ -7385,11 +7519,12 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // campfire's `Message.with_attachment_details` costs the room page two
 // queries where it cost eighty.
 //
-// Known gaps, deliberate: has_one, direct has_many with a scope or
-// polymorphic owner, and scope-carrying through-assocs (other than a
-// plain `order("...")`) get no batch arm — the dispatch
+// Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
+// with a scope or polymorphic owner, and scope-carrying through-assocs
+// (other than a plain `order("...")`) get no batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
-// Rails, which also lazy-loads what `includes` doesn't name). Assigning
+// Rails, which also lazy-loads what `includes` doesn't name). Unscoped
+// non-polymorphic has_one uses PreloadKind::HasOne (first-wins). Assigning
 // a belongs_to (`c.story = s`) on a PRELOADED record does not refresh
 // the cache (fresh records never have the loaded flag set, so the
 // benchmark's build-then-render flows are unaffected).
@@ -7518,6 +7653,9 @@ enum PreloadKind {
     BelongsTo { fk: String, target: String, table: String },
     /// (fk column on the target, target class)
     HasMany { fk: String, target: String },
+    /// `has_one` — same FK-on-target batch as has_many, installing one
+    /// record (or nil) per owner through the single-record preload setter.
+    HasOne { fk: String, target: String },
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
@@ -7532,6 +7670,9 @@ enum PreloadKind {
     /// `has_rich_text :<attr>`: one `IN` over `action_text_rich_texts`,
     /// installed through the owner's load-once setter.
     RichText { attr: String, owner: String },
+    /// `has_markdown :<attr>`: one `IN` over `action_text_markdowns`,
+    /// installed through the owner's load-once setter.
+    PlainText { attr: String, owner: String },
 }
 
 /// Select association shapes whose batch queries preserve the reader's filters,
@@ -7570,6 +7711,24 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::HasMany {
+                        fk: foreign_key.as_str().to_string(),
+                        target: target.0.as_str().to_string(),
+                    },
+                ));
+            }
+            // Same restriction as has_many: FK-only batch. Scoped or
+            // polymorphic has_one stays on the lazy reader until the
+            // batch can preserve those predicates.
+            Association::HasOne {
+                name, target, foreign_key,
+                scope: None, as_interface: None, ..
+            } => {
+                if !model_exists(target) {
+                    continue;
+                }
+                out.push((
+                    name.as_str().to_string(),
+                    PreloadKind::HasOne {
                         fk: foreign_key.as_str().to_string(),
                         target: target.0.as_str().to_string(),
                     },
@@ -7645,6 +7804,17 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
             out.push((
                 format!("rich_text_{}", attr.as_str()),
                 PreloadKind::RichText {
+                    attr: attr.as_str().to_string(),
+                    owner: model.name.0.as_str().to_string(),
+                },
+            ));
+        }
+    }
+    if model_exists(&crate::lower::plain_text_attr::record_class()) {
+        for (_span, attr) in crate::lower::plain_text_attr::plain_text_attrs(model) {
+            out.push((
+                format!("markdown_{}", attr.as_str()),
+                PreloadKind::PlainText {
                     attr: attr.as_str().to_string(),
                     owner: model.name.0.as_str().to_string(),
                 },
@@ -7733,6 +7903,32 @@ def self._preload_batch_{name}(records)
   end
   records.each do |r|
     r._preload_{name}(grouped[r.id] || [])
+  end
+  loaded
+end
+"#
+                );
+            }
+            PreloadKind::HasOne { fk, target } => {
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  ids = []
+  records.each do |r|
+    ids << r.id
+  end
+  by_id = {{}}
+  loaded = []
+  if ids.length > 0
+    loaded = ActiveRecord::Relation.new({target}).where({fk}: ids).to_a
+  end
+  loaded.each do |rec|
+    k = rec.{fk}
+    by_id[k] = rec if by_id[k].nil?
+  end
+  records.each do |r|
+    r._preload_{name}(by_id[r.id])
   end
   loaded
 end
@@ -7841,6 +8037,31 @@ end
 "#
                 );
             }
+            PreloadKind::PlainText { attr, owner } => {
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  ids = []
+  records.each do |r|
+    ids << r.id
+  end
+  by_id = {{}}
+  loaded = []
+  if ids.length > 0
+    loaded = ActiveRecord::Relation.new(ActionText::Markdown).where(record_type: "{owner}", name: "{attr}", record_id: ids).to_a
+  end
+  loaded.each do |rec|
+    by_id[rec.record_id] = rec
+  end
+  records.each do |r|
+    r._preload_{name}(by_id[r.id])
+  end
+  loaded
+end
+"#
+                );
+            }
         }
     }
 
@@ -7856,8 +8077,10 @@ end
             let target = match kind {
                 PreloadKind::BelongsTo { target, .. } => Some(target.as_str()),
                 PreloadKind::HasMany { target, .. } => Some(target.as_str()),
+                PreloadKind::HasOne { target, .. } => Some(target.as_str()),
                 PreloadKind::Through { target, .. } => Some(target.as_str()),
                 PreloadKind::RichText { .. } => Some("ActionText::RichText"),
+                PreloadKind::PlainText { .. } => Some("ActionText::Markdown"),
                 // `includes(logo_attachment: :blob)`: the blob is already
                 // in the row the loader fetched; there is no model to
                 // recurse into.

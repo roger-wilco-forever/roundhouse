@@ -62,7 +62,20 @@ their relative precedence is a deterministic approximation, not Rails'
 engine load order. Collisions between non-host roots therefore need
 manual checking.
 Roundhouse does not read an engine's own `config/routes.rb` yet.
-The host's `mount` of the engine remains a dropped route.
+The host's `mount` of the engine is omitted with an error diagnostic at
+its route declaration, while supported sibling routes and other diagnostics
+remain available. Strict transpilation refuses to write that incomplete
+project; `--allow-unsupported` explicitly overrides the error. `--survey`
+(and `check --continue`) also records the omission in its gap ledger, but
+surveying alone does not make the mount supported. Discovering an engine's
+application code does not imply support for its mounted routes.
+Built-in ActiveStorage routes remain supplied separately by the runtime.
+A top-level `mount ActionCable.server => "/cable"` (or the equivalent `at:`
+form) keeps the existing runtime endpoint. Its path is fixed at `/cable`;
+custom paths and nested/constraint-wrapped mounts remain unsupported.
+The existing CRuby/JRuby pruning policy still omits Cable from apps without
+a live broadcast surface; the mount exemption does not change that policy.
+
 
 Routed templates without an explicit controller method participate in
 the shared callback dispatcher. The separate Rails-to-Roda converter
@@ -245,6 +258,10 @@ from seeing a definition, and *(the `X` gem is in the Gemfile and
 roundhouse does not model it)* means the receiver comes from a gem the
 census lists as unknown. Skip these on a first read. They exist so the
 error count above means "findings", not "shadows of gaps".
+
+Unresolved source constants keep their error severity even when the
+gem census identifies a likely owner: their emitted expression is a
+refusal stub. Gem context is added without certifying runtime support.
 
 **The survey report** — printed only with `--continue`: every construct
 ingest skipped, bucketed by kind, most frequent first, with the files

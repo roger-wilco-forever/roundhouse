@@ -66,7 +66,10 @@ pub fn classify_sub<'a>(lhs: &'a Expr, rhs: &'a Expr) -> SubCase<'a> {
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => SubCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => SubCase::NumericPromote,
-        (Ty::Array { elem: l }, Ty::Array { elem: r }) if l == r => {
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            SubCase::NumericPromote
+        }
+        (Ty::Array { elem: l }, Ty::Array { .. }) => {
             SubCase::ArrayDifference { elem: l.as_ref() }
         }
         // Time `-` is receiver-overloaded and not disambiguable from
@@ -78,9 +81,13 @@ pub fn classify_sub<'a>(lhs: &'a Expr, rhs: &'a Expr) -> SubCase<'a> {
         // first-class `Ty::Time` variant (datetime columns hydrate to it,
         // possibly as a `Time | Nil` union) and a legacy concrete
         // `Class { Time }` (`Time.now`/`Time.current`/`Time.at`).
+        _ if super::operand::is_user_operator_receiver(lhs) => SubCase::Unknown,
         _ if is_time_operand(lhs_ty) || is_time_operand(rhs_ty) => {
             SubCase::Unknown
         }
+        // Date - Integer (day shift) and Date - Date (Rational day
+        // count) are valid Ruby; lowering grounds the Integer form.
+        (Ty::Date, Ty::Int) | (Ty::Date, Ty::Date) => SubCase::Unknown,
         _ => SubCase::Incompatible,
     }
 }
@@ -150,10 +157,11 @@ mod tests {
     }
 
     #[test]
-    fn array_minus_array_different_elem_is_incompatible() {
+    fn array_minus_array_different_elem_is_a_difference() {
+        // `[1] - ["a"]` is valid Ruby (nothing matches); elements are compared by `eql?`.
         let l = var_typed("a", Ty::Array { elem: Box::new(Ty::Int) });
         let r = var_typed("b", Ty::Array { elem: Box::new(Ty::Str) });
-        assert!(matches!(classify_sub(&l, &r), SubCase::Incompatible));
+        assert!(matches!(classify_sub(&l, &r), SubCase::ArrayDifference { .. }));
     }
 
     #[test]

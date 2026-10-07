@@ -55,6 +55,10 @@ pub enum AddCase {
 }
 
 /// Classify a pair of operands for `+` emission.
+fn is_time(ty: &Ty) -> bool {
+    matches!(ty, Ty::Time) || matches!(ty, Ty::Class { id, .. } if id.0.as_str() == "Time")
+}
+
 pub fn classify_add(lhs: &Expr, rhs: &Expr) -> AddCase {
     let lhs_ty = lhs.ty.as_ref();
     let rhs_ty = rhs.ty.as_ref();
@@ -68,13 +72,29 @@ pub fn classify_add(lhs: &Expr, rhs: &Expr) -> AddCase {
         return AddCase::Unknown;
     }
 
+    // `Time + seconds` / `Time + Duration` is a Time; only `Time + Time`
+    // (and `Time + String`) is the TypeError.
+    if is_time(lhs_ty.unwrap()) && !is_time(rhs_ty.unwrap()) && !matches!(rhs_ty, Some(Ty::Str)) {
+        return AddCase::Unknown;
+    }
+    if super::operand::is_user_operator_receiver(lhs) {
+        return AddCase::Unknown;
+    }
+
     let lhs_ty = lhs_ty.unwrap();
     let rhs_ty = rhs_ty.unwrap();
 
     match (lhs_ty, rhs_ty) {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => AddCase::Numeric,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => AddCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            AddCase::NumericPromote
+        }
         (Ty::Str, Ty::Str) => AddCase::StringConcat,
+        // Date + Integer is Ruby (and ActiveSupport) day arithmetic.
+        // Lowering grounds it to `date_days_since` for Spinel; CRuby
+        // keeps native `+`. Not Incompatible.
+        (Ty::Date, Ty::Int) => AddCase::Unknown,
         _ => {
             // Collection `+` collection is *always* valid Ruby — it
             // concatenates regardless of element types, yielding

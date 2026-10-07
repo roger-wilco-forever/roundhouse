@@ -14,7 +14,7 @@ use crate::{ClassId, Symbol};
 use super::expr::ingest_expr;
 use super::util::{
     class_name_path, collect_comments, constant_id_str, constant_path_of, drain_comments_before,
-    find_all_classes_with_nesting, find_first_class, flatten_statements, source_has_blank_line,
+    find_all_classes_with_nesting, flatten_statements, source_has_blank_line,
     symbol_list_style, symbol_list_value, symbol_value,
 };
 use super::{IngestError, IngestResult};
@@ -43,8 +43,11 @@ pub(super) fn ingest_controller_with_nesting(
     // is the class whose name ends in `Controller`, not the first
     // class in the file; picking the first ingests an empty error
     // class as the controller and drops every real action (so its
-    // view ivars never resolve). Fall back to the first class when no
-    // name matches the convention.
+    // view ivars never resolve). When no name matches, fall back to
+    // the first class that descends from a controller base — so
+    // nested `Admin::Base < ApplicationController` keeps filter
+    // ancestry, while concern-nested `T::Struct` VOs and other plain
+    // objects return `None` for the library/concern path.
     let all_classes = find_all_classes_with_nesting(&root);
     let chosen_idx = all_classes.iter().position(|(_, _, c)| {
         class_name_path(c)
@@ -93,10 +96,15 @@ pub(super) fn ingest_controller_with_nesting(
             let (s, n, c) = all_classes.into_iter().nth(i).expect("chosen index in range");
             (s, n, Some(c))
         }
-        None => match all_classes.into_iter().next() {
-            Some((s, n, c)) => (s, n, Some(c)),
-            None => (Vec::new(), Vec::new(), find_first_class(&root)),
-        },
+        None => {
+            match all_classes
+                .into_iter()
+                .find(|(_, _, c)| descends_from_controller(c))
+            {
+                Some((s, n, c)) => (s, n, Some(c)),
+                None => (Vec::new(), Vec::new(), None),
+            }
+        }
     };
     let Some(class) = class else {
         return Ok(None);
@@ -122,6 +130,7 @@ pub(super) fn ingest_controller_with_nesting(
     let mut comments = collect_comments(&result);
     drain_comments_before(&mut comments, class.location().start_offset());
     let mut body_items: Vec<ControllerBodyItem> = Vec::new();
+    let owner = ClassId(Symbol::from(name_path.join("::")));
     let mut layout = LayoutDecl::Inherit;
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
@@ -161,6 +170,57 @@ pub(super) fn ingest_controller_with_nesting(
                         },
                         leading_blank_line: i == 0 && leading_blank,
                     });
+                }
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
+            // Class-side methods: `def self.x`, and every `def` in a
+            // `class << self`. They are methods of the controller CLASS,
+            // not actions — read as actions (as a `def self.x` used to
+            // be) they became instance methods, and a `class << self`
+            // block reached the expression ingester, which refused it.
+            let class_side = if let Some(def) = stmt.as_def_node() {
+                def.receiver()
+                    .is_some_and(|r| r.as_self_node().is_some())
+                    .then(|| super::library_class::ingest_library_method(&def, &owner, file))
+                    .map(|m| m.map(|m| (vec![m], Vec::new())))
+            } else if let Some(sc) = stmt.as_singleton_class_node() {
+                Some(
+                    super::singleton_class::ingest_singleton_body(&sc, &owner, file, &|def| {
+                        super::library_class::ingest_library_method(def, &owner, file)
+                    })
+                    .map(|b| (b.methods, b.class_body)),
+                )
+            } else {
+                None
+            };
+            if let Some(result) = class_side {
+                match result {
+                    Ok((methods, class_body)) => {
+                        let mut leading = leading;
+                        let mut blank = leading_blank;
+                        let items = methods
+                            .into_iter()
+                            .map(|method| ControllerBodyItem::ClassMethod {
+                                configuration_slot: None,
+                                configuration_role: None,
+                                method,
+                                leading_comments: Vec::new(),
+                                leading_blank_line: false,
+                            })
+                            .chain(class_body.into_iter().map(|expr| ControllerBodyItem::Unknown {
+                                expr,
+                                leading_comments: Vec::new(),
+                                leading_blank_line: false,
+                            }));
+                        for mut item in items {
+                            *item.leading_comments_mut() = std::mem::take(&mut leading);
+                            item.set_leading_blank_line(std::mem::take(&mut blank));
+                            body_items.push(item);
+                        }
+                    }
+                    Err(err) if super::survey::is_active() => super::survey::record(&err),
+                    Err(err) => return Err(err),
                 }
                 prev_end = Some(stmt.location().end_offset());
                 continue;
@@ -568,14 +628,14 @@ pub const VERIFY_AUTHENTICITY_TOKEN: &str = "verify_authenticity_token";
 /// `protect_from_forgery with: :exception, unless: -> { … }` /
 /// `skip_forgery_protection only: […]` → the filter Rails registers.
 ///
-/// Only the `:exception` strategy is modeled. Rails' bare
-/// `protect_from_forgery` defaults to `:null_session` (the request runs
-/// with an empty session), and `:reset_session` clears it; neither is a
-/// 422, and lowering them as one would turn a request Rails lets through
-/// into a failure. Those forms, a `prepend:` (which moves the callback
-/// to the head of the chain) and a custom `store:` return `None`, so the
-/// call stays a controller-body macro and the unrecognized-macro survey
-/// names it.
+/// `protect_from_forgery` / `skip_forgery_protection` → the filter Rails
+/// registers on `verify_authenticity_token`.
+///
+/// Rails' handler for an unverified request depends on `with:`
+/// (`:exception` 422, `:null_session` empty session, `:reset_session`
+/// wipe). This runtime has one handler — 422 — so every known strategy
+/// registers the same before/skip filter. A `prepend:` or custom
+/// `store:` still returns `None` (unrecognized-macro survey).
 fn parse_forgery_macro(
     call: &ruby_prism::CallNode<'_>,
     protect: bool,
@@ -591,7 +651,7 @@ fn parse_forgery_macro(
     let mut unless_cond: Option<Symbol> = None;
     let mut if_cond_expr: Option<Expr> = None;
     let mut unless_cond_expr: Option<Expr> = None;
-    let mut exception_strategy = false;
+    let mut known_with = true;
 
     for arg in call.arguments().iter().flat_map(|a| a.arguments().iter()) {
         let kh = arg.as_keyword_hash_node()?;
@@ -601,7 +661,10 @@ fn parse_forgery_macro(
             let value = assoc.value();
             match key.as_str() {
                 "with" if protect => {
-                    exception_strategy = symbol_value(&value).as_deref() == Some("exception");
+                    known_with = matches!(
+                        symbol_value(&value).as_deref(),
+                        Some("exception" | "null_session" | "reset_session")
+                    );
                 }
                 "only" => {
                     only = symbol_list_value(&value);
@@ -631,7 +694,7 @@ fn parse_forgery_macro(
             }
         }
     }
-    if protect && !exception_strategy {
+    if protect && !known_with {
         return None;
     }
 
@@ -908,4 +971,16 @@ pub fn render_template_name(args: &[Expr]) -> Option<Symbol> {
         }),
         _ => None,
     }
+}
+
+/// Whether `class`'s superclass names a controller: anything under
+/// `ActionController::` (`Base`, `API`, `Metal`), or a constant whose
+/// last segment ends in `Controller` (`ApplicationController`,
+/// `Admin::SectionController`).
+fn descends_from_controller(class: &ruby_prism::ClassNode<'_>) -> bool {
+    let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n)) else {
+        return false;
+    };
+    parent.first().is_some_and(|s| s == "ActionController")
+        || parent.last().is_some_and(|s| s.ends_with("Controller"))
 }

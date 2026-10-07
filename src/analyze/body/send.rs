@@ -111,14 +111,15 @@ impl<'a> BodyTyper<'a> {
     /// `.keys` on the result then read as a dispatch failure against a
     /// feature the pipeline fully supports (issue #75).
     ///
-    /// The shape test mirrors `lower::group_count::rewrite` exactly —
-    /// zero-arg, block-less `count` whose receiver is a `group(...)`
-    /// send — so the type this reports and the method the lowering
-    /// actually emits cannot disagree. Widening one without the other
-    /// is the failure mode to avoid: `sum`/`average`/`minimum`/
-    /// `maximum` switch to a grouped Hash in Rails too, but no
-    /// `group_sum` lowering or runtime method exists, so typing them
-    /// here would trade a false error for a false PASS.
+    /// The shape test mirrors `lower::group_count::rewrite` — zero-arg,
+    /// block-less `count` whose receiver chain contains `group(...)`,
+    /// walking the same refiners (`having`, `distinct`, `select`, …) —
+    /// so the type this reports and the method the lowering actually
+    /// emits cannot disagree. Widening one without the other is the
+    /// failure mode to avoid: `sum`/`average`/`minimum`/`maximum`
+    /// switch to a grouped Hash in Rails too, but no `group_sum`
+    /// lowering or runtime method exists, so typing them here would
+    /// trade a false error for a false PASS.
     ///
     /// The key type is the grouped COLUMN's, read off the schema the
     /// same way `column_projection` does — `group(:feed_id).count.keys`
@@ -137,12 +138,7 @@ impl<'a> BodyTyper<'a> {
         if method.as_str() != "count" || !args.is_empty() || block.is_some() {
             return None;
         }
-        let ExprNode::Send { method: gm, args: group_args, .. } = &*recv?.node else {
-            return None;
-        };
-        if gm.as_str() != "group" {
-            return None;
-        }
+        let group_args = Self::group_args_in_count_chain(recv?)?;
         // The receiver of `count` is the `group(...)` result, so its
         // type names the model whose schema owns the grouped column.
         // Both relation representations reach here: an inline
@@ -158,6 +154,10 @@ impl<'a> BodyTyper<'a> {
         };
         let key = self.grouped_key_ty(model, group_args).unwrap_or(Ty::Untyped);
         Some(Ty::Hash { key: Box::new(key), value: Box::new(Ty::Int) })
+    }
+
+    fn group_args_in_count_chain(expr: &Expr) -> Option<&[Expr]> {
+        crate::lower::group_count::group_in_relation_chain(expr).map(|g| g.group_args)
     }
 
     /// The column type a single-symbol `group(:col)` groups by, when the
@@ -185,6 +185,8 @@ impl<'a> BodyTyper<'a> {
         let ExprNode::Lambda { params, .. } = &*block.node else {
             return new_ctx;
         };
+        for name in params { new_ctx.class_objects.remove(name); }
+        super::forget_class_object_writes(block, &mut new_ctx);
         // `form_with model: product do |form|` / `form_for @product do
         // |f|`: the builder is parameterized by the record the form is
         // for, so `form.object` (and `form.object.errors`) answer it.
@@ -318,6 +320,7 @@ impl<'a> BodyTyper<'a> {
             return self.block_params_for(Some(&as_array), method);
         }
         match recv_ty {
+            Ty::Str if method.as_str() == "bytes" => Some(vec![Ty::Int]),
             Ty::Array { elem } => match method.as_str() {
                 "each" | "map" | "collect" | "flat_map" | "collect_concat"
                 | "select" | "filter" | "reject"
@@ -416,9 +419,16 @@ impl<'a> BodyTyper<'a> {
                                 // username and a password. Spread them,
                                 // or the second parameter binds nothing
                                 // and everything read from it is
-                                // untyped.
+                                // untyped. A block of ONE parameter
+                                // yields that parameter's type and a
+                                // block of none yields nothing: the
+                                // block's `Ty::Fn` is its signature,
+                                // not the value it yields. (A stub
+                                // that registers the yielded type
+                                // itself has a non-`Fn` block and
+                                // takes the last arm.)
                                 Ty::Fn { block: Some(block_ty), .. } => match &**block_ty {
-                                    Ty::Fn { params, .. } if params.len() > 1 => Some(
+                                    Ty::Fn { params, .. } => Some(
                                         params
                                             .iter()
                                             .map(|p| p.ty.subst_self(&self_ty))
@@ -616,6 +626,40 @@ impl<'a> BodyTyper<'a> {
         block_ret: Option<&Ty>,
         args: &[crate::expr::Expr],
     ) -> Ty {
+        // `Parameters` is a Hash-shaped bag: what its own class does not
+        // answer (`fetch`, `each`, `map`, `count`, ...) is the Hash
+        // reading over Symbol -> param value. Done here,
+        // not only where a `params` receiver is typed, so the Parameters
+        // arm of an element read's union answers the same surface.
+        if let Some(Ty::Class { id, .. }) = recv_ty {
+            if id.0.as_str() == "ActionController::Parameters"
+                && method.as_str() != "new"
+                && !self.classes().get(id).is_some_and(|c| {
+                    c.instance_methods.contains_key(method) || c.class_methods.contains_key(method)
+                })
+            {
+                let as_hash = params_as_hash();
+                return self.dispatch(Some(&as_hash), method, block_ret, args);
+            }
+        }
+        // `self[:generated_at]` / `read_attribute(:generated_at)` read
+        // the attribute TYPECAST, so `Time?` for a datetime column and
+        // `BigDecimal?` for a decimal one -- the same value the
+        // column's own reader answers. The catalog entry for `[]`
+        // and `read_attribute` says `String`, the shape of the
+        // storage text the lowered model deals in, which is not what
+        // the source program reads: `self[:rate] || BigDecimal("1")`
+        // was `String`, and `1 / rate` an "Integer / String" error.
+        // Only a literal name that IS an attribute is answered; any
+        // other key keeps the catalog's answer.
+        if let (true, Some(Ty::Class { id, .. })) = (
+            matches!(method.as_str(), "[]" | "read_attribute" | "_read_attribute"),
+            recv_ty,
+        ) {
+            if let Some(ty) = self.attribute_by_name(id, args) {
+                return ty;
+            }
+        }
         // A tuple (a method returning `[a, b]` of mixed types — see
         // `tuple_return_ty`) is still an Array at runtime: anything but
         // destructuring reads it as one, over the union of its slots.
@@ -895,6 +939,40 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "ActiveSupport" && method.as_str() == "parse_db_date" {
                     return Ty::Union { variants: vec![Ty::Date, Ty::Nil] };
                 }
+                // The Date calendar intrinsics `time_calendar` lowers to.
+                if id.0.as_str() == "ActiveSupport" {
+                    match method.as_str() {
+                        "date_current"
+                        | "date_from_civil"
+                        | "date_days_since"
+                        | "date_days_ago"
+                        | "date_yesterday"
+                        | "date_tomorrow"
+                        | "date_weeks_since"
+                        | "date_weeks_ago"
+                        | "date_months_since"
+                        | "date_months_ago"
+                        | "date_years_since"
+                        | "date_years_ago"
+                        | "date_beginning_of_week"
+                        | "date_end_of_week"
+                        | "date_next_week"
+                        | "date_prev_week"
+                        | "date_beginning_of_month"
+                        | "date_end_of_month"
+                        | "date_beginning_of_year"
+                        | "date_end_of_year" => return Ty::Date,
+                        "date_at_midnight"
+                        | "date_beginning_of_day"
+                        | "date_end_of_day" => return Ty::Time,
+                        "date_today?"
+                        | "date_yesterday?"
+                        | "date_tomorrow?"
+                        | "date_past?"
+                        | "date_future?" => return Ty::Bool,
+                        _ => {}
+                    }
+                }
                 if id.0.as_str() == "ActiveSupport" && method.as_str() == "format_db_date" {
                     return if matches!(call_args.first().and_then(|a| a.ty.as_ref()), Some(Ty::Date)) {
                         Ty::Str
@@ -1000,6 +1078,16 @@ impl<'a> BodyTyper<'a> {
                 }
                 let mut steps = 0usize;
                 let mut unknown_named_ancestor = false;
+                // The first `method_missing` on the ancestor walk (the
+                // class's own, then its mixins', then its parents').
+                // Ruby consults it only once the WHOLE chain has failed
+                // to find the method, so it is held here and applied
+                // after the walk, never in place of a real method.
+                let mut method_missing_ty: Option<Ty> = None;
+                // Whether the walk has been through a class the RBI did not
+                // declare: an app class inheriting a gem class gets what the
+                // gem's macros generate on top of the declared surface.
+                let mut via_undeclared = false;
                 while let Some(cid) = current_id {
                     depth += 1;
                     if depth > 32 {
@@ -1012,6 +1100,12 @@ impl<'a> BodyTyper<'a> {
                         break;
                     };
                     steps += 1;
+                    if cls.open || (cls.gem_boundary && via_undeclared) {
+                        unknown_named_ancestor = true;
+                    }
+                    if !cls.gem_boundary {
+                        via_undeclared = true;
+                    }
                     // A signature found ANYWHERE on this walk may name
                     // the receiving class as `instance` /
                     // `T.attached_class` — a fact the declaring class
@@ -1029,6 +1123,44 @@ impl<'a> BodyTyper<'a> {
                         let receiver_is_model = self.classes().get(id).is_some_and(|c| c.table.is_some());
                         if cid != id && cls.table.is_some() && receiver_is_model { ty.rebind_class(cid, id) } else { ty }
                     };
+                    // The class object and its instances share this one type, so a
+                    // name both sides define is ambiguous. The catalog gives every model
+                    // the relation builders (`order`, `group`, `limit`, `page`, …)
+                    // class-side; an instance may own the same name as a reader
+                    // (`belongs_to :order`, `delegated_type` singular `page`, …).
+                    // A relation builder called with no arguments is not a useful
+                    // query shape here (`Refund.order` is an error; bare
+                    // `leaf.page` is the delegated_type reader, not
+                    // `Relation[Leaf]`), so the zero-argument call is the
+                    // instance reader. Callers that want the builder pass an
+                    // argument (`Model.page(2)`, `Model.order(:name)`).
+                    if call_args.is_empty()
+                        && matches!(
+                            method.as_str(),
+                            "order"
+                                | "group"
+                                | "limit"
+                                | "offset"
+                                | "having"
+                                | "joins"
+                                | "includes"
+                                | "select"
+                                | "distinct"
+                                | "page"
+                                | "per"
+                                | "paginate"
+                                | "padding"
+                                | "without_count"
+                        )
+                    {
+                        if let (Some(cm), Some(im)) =
+                            (cls.class_methods.get(method), cls.instance_methods.get(method))
+                        {
+                            if matches!(unwrap_fn_ret(cm), Ty::Relation { .. }) {
+                                return unwrap_fn_ret(&subst(im));
+                            }
+                        }
+                    }
                     if let Some(ty) = cls.class_methods.get(method) {
                         return unwrap_fn_ret(&subst(ty));
                     }
@@ -1044,6 +1176,16 @@ impl<'a> BodyTyper<'a> {
                         if let Some(ty) = self.lookup_in_module(module_id, method) {
                             return subst(&ty);
                         }
+                    }
+                    // Class-object sends only consult class-side
+                    // `method_missing`. Instance / included handlers answer
+                    // instance sends; applying them here would type an
+                    // undefined class-side call from an RBS instance sig.
+                    if method_missing_ty.is_none() {
+                        method_missing_ty = cls
+                            .class_methods
+                            .get(&Symbol::from("method_missing"))
+                            .cloned();
                     }
                     current_id = cls.parent.as_ref();
                 }
@@ -1166,6 +1308,19 @@ impl<'a> BodyTyper<'a> {
                 if id.0.as_str() == "Process" && method.as_str() == "pid" {
                     return Ty::Int;
                 }
+                // `Process.clock_gettime(clock, unit = :float_second)`:
+                // the `:float_*` units answer Float; every other unit
+                // (`:millisecond`, `:microsecond`, `:nanosecond`, …)
+                // answers Integer. No unit means Float.
+                if id.0.as_str() == "Process" && method.as_str() == "clock_gettime" {
+                    return match call_args.get(1).map(|a| &*a.node) {
+                        None => Ty::Float,
+                        Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => {
+                            if value.as_str().starts_with("float_") { Ty::Float } else { Ty::Int }
+                        }
+                        Some(_) => Ty::Untyped,
+                    };
+                }
                 // JSON stdlib — `JSON.generate` and `JSON.dump` return
                 // String; `JSON.parse` / `JSON.load` return parsed
                 // structure (untyped — the body is genuinely
@@ -1200,6 +1355,19 @@ impl<'a> BodyTyper<'a> {
                 // after the precise builtins above have had their say.
                 if unknown_named_ancestor {
                     return Ty::Untyped;
+                }
+                // The chain never defined the method but a class on it
+                // defines `method_missing`: the message is answered at
+                // runtime, by code the analyzer cannot follow name by
+                // name (core's `CustomerAccountUrlHelpers` turns
+                // `customer_account_*_url` into a `UrlHelpers` send). The
+                // answer is what `method_missing` is declared to return,
+                // gradual when it says nothing more.
+                if let Some(mm) = method_missing_ty {
+                    return match unwrap_fn_ret(&mm) {
+                        Ty::Var { .. } => Ty::Untyped,
+                        t => t,
+                    };
                 }
                 unknown()
             }
@@ -1321,6 +1489,17 @@ impl<'a> BodyTyper<'a> {
                 // An initial value decides the result type (`[1, 2].sum(0.0)` is a Float).
                 if method.as_str() == "sum" && !args.is_empty() {
                     return Ty::Untyped;
+                }
+                // `[] + [h]` is an Array of `h`: when the receiver's
+                // element is empty or not yet known, `+`, `|` and
+                // `concat` take the argument's. A known receiver element
+                // keeps answering for the result, as before.
+                if let ("+" | "|" | "concat", [other]) = (method.as_str(), args) {
+                    if let (Ty::Var { .. } | Ty::Bottom, Some(Ty::Array { elem: other })) =
+                        (elem, &other.ty)
+                    {
+                        return Ty::Array { elem: other.clone() };
+                    }
                 }
                 array_method(method, elem, block_ret)
             }
@@ -1461,6 +1640,7 @@ impl<'a> BodyTyper<'a> {
             Some(Ty::Record { row }) => record_method(method, row, args),
             // A method the app adds by reopening `String` (campfire's
             // `all_emoji?`) answers where the builtin table has nothing.
+            Some(Ty::Str) if method.as_str() == "bytes" && block_ret.is_some() => Ty::Str,
             Some(Ty::Str) => match str_method(method) {
                 Ty::Var { .. } => self
                     .lookup_string_instance(method)
@@ -1475,6 +1655,12 @@ impl<'a> BodyTyper<'a> {
             // has no user-defined ancestors in this corpus.
             Some(Ty::Time) => time_method(method).unwrap_or_else(unknown),
             Some(Ty::Date) => date_method(method, args).unwrap_or_else(unknown),
+            // `Integer#in_time_zone` lowers only for ≤1 arg (invariant 6).
+            Some(Ty::Int)
+                if method.as_str() == "in_time_zone" && args.len() > 1 =>
+            {
+                unknown()
+            }
             Some(Ty::Int) => int_method(method),
             Some(Ty::Float) => float_method(method),
             Some(Ty::Bool) => bool_method(method),
@@ -1525,6 +1711,29 @@ impl<'a> BodyTyper<'a> {
             // resolves the read instead of leaving it `Var`.
             _ => conversion_fallback(method).unwrap_or_else(unknown),
         }
+    }
+
+    /// The type of the attribute a literal `:name` / `"name"` argument
+    /// names on `class`, its own or an ancestor's (`self[:name]`).
+    fn attribute_by_name(&self, class: &ClassId, args: &[Expr]) -> Option<Ty> {
+        let [arg] = args else { return None };
+        let ExprNode::Lit { value } = &*arg.node else { return None };
+        let key = match value {
+            crate::expr::Literal::Sym { value } => value.clone(),
+            crate::expr::Literal::Str { value } => Symbol::from(value.as_str()),
+            _ => return None,
+        };
+        let mut cursor = Some(class.clone());
+        // Bounded: a parent link that cycles must not hang the typer.
+        for _ in 0..16 {
+            let cur = cursor?;
+            let info = self.classes().get(&cur)?;
+            if let Some(ty) = info.attributes.fields.get(&key) {
+                return Some(ty.clone());
+            }
+            cursor = info.parent.clone();
+        }
+        None
     }
 
     /// Resolve `method` against a mixed-in module's registered methods,
@@ -1589,7 +1798,7 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
-    fn lookup_in_module(&self, module_id: &ClassId, method: &Symbol) -> Option<Ty> {
+    pub(super) fn lookup_in_module(&self, module_id: &ClassId, method: &Symbol) -> Option<Ty> {
         let mut stack = vec![module_id.clone()];
         let mut seen = std::collections::BTreeSet::new();
         while let Some(id) = stack.pop() {
@@ -1781,7 +1990,11 @@ fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
         "parse" => vec![Ty::Str, Ty::Bool, numeric],
         "strptime" => vec![Ty::Str, Ty::Str, numeric],
         "iso8601" => vec![Ty::Str, numeric],
+        // `Date.today` is Ruby stdlib (optional start-day). Rails'
+        // `Date.current` / `yesterday` / `tomorrow` take no arguments.
         "today" => vec![numeric],
+        // ActiveSupport's zone-aware today / neighbors; lowered by `time_calendar`.
+        "current" | "yesterday" | "tomorrow" => vec![],
         _ => return None,
     };
     let accepts = |actual: Option<&Ty>, expected: &Ty| match actual {
@@ -1797,15 +2010,100 @@ fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
 }
 
 fn date_method(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
+    let date = || Ty::Date;
+    let time = || Ty::Time;
+    // Known Integer (or not-yet-typed). Untyped is excluded for day-shift
+    // results: Spinel Date has no `+`/`-`, and lowering only grounds Int/Var.
+    let int_shift = |a: Option<&Ty>| {
+        a.is_none_or(|t| matches!(t, Ty::Int | Ty::Var { .. }))
+    };
+    // `ActiveSupport.in_time_zone` takes a String?/Symbol zone (runtime
+    // `to_s`); reject known non-zone types such as `TimeZoneData`.
+    let zone_arg = |a: Option<&crate::expr::Expr>| {
+        a.is_none_or(|e| {
+            matches!(
+                e.ty.as_ref(),
+                None | Some(Ty::Str | Ty::Sym | Ty::Nil | Ty::Var { .. } | Ty::Untyped)
+            )
+        })
+    };
+    // Arity must match `lower::time_calendar::rewrite_date_value` — typing
+    // a send the lowerer leaves alone is invariant 6 (silent NoMethodError).
+    let zero = args.is_empty();
+    let at_most_one_int = args.len() <= 1 && args.first().map(|a| int_shift(a.ty.as_ref())).unwrap_or(true);
     Some(match method.as_str() {
-        ">>" | "<<" if args.len() == 1
-            && args[0].ty.as_ref().is_none_or(|t| matches!(t, Ty::Int | Ty::Var { .. })) => Ty::Date,
-        "to_date" => Ty::Date,
-        "to_time" => Ty::Time,
-        "year" | "month" | "mon" | "day" | "mday" | "wday" | "yday" => Ty::Int,
+        // Stdlib month shift stays on Date (Spinel implements >> / <<).
+        // `Date >> Untyped` stays gradual — same bar as `+` (operand may
+        // not be an Integer; claiming Date would green-light Date-only
+        // follow-ups after a send that can TypeError).
+        ">>" | "<<" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Untyped) => Ty::Untyped,
+            Some(Ty::Int) | Some(Ty::Var { .. }) | None => date(),
+            _ => return None,
+        },
+        // `Date + Integer` → Date. `Date + Untyped` stays gradual: the
+        // operand might not be an Integer day shift, and Spinel has no `+`.
+        "+" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Untyped) => Ty::Untyped,
+            Some(Ty::Int) | Some(Ty::Var { .. }) | None => date(),
+            _ => return None,
+        },
+        // `Date - Integer` → Date; `Date - Date` → a Rational day count
+        // we do not model structurally (gradual, like Time − Time).
+        // `Date - Untyped` stays gradual for the same reason as `+`.
+        "-" if args.len() == 1 => match args[0].ty.as_ref() {
+            Some(Ty::Date) | Some(Ty::Untyped) => Ty::Untyped,
+            Some(Ty::Int) | Some(Ty::Var { .. }) | None => date(),
+            _ => return None,
+        },
+        "to_date" if zero => date(),
+        // ActiveSupport calendar that preserves a date-only value.
+        "yesterday" | "tomorrow" | "next_week" | "prev_week" | "last_week"
+        | "last_month" | "last_year"
+        | "beginning_of_week" | "end_of_week" | "at_beginning_of_week" | "at_end_of_week"
+        | "beginning_of_month" | "end_of_month" | "at_beginning_of_month" | "at_end_of_month"
+        | "beginning_of_year" | "end_of_year" | "at_beginning_of_year" | "at_end_of_year"
+            if zero =>
+        {
+            date()
+        }
+        "prev_day" | "next_day" | "days_ago" | "days_since" | "weeks_ago" | "weeks_since"
+        | "next_month" | "prev_month" | "months_ago" | "months_since"
+        | "next_year" | "prev_year" | "years_ago" | "years_since"
+            if at_most_one_int =>
+        {
+            date()
+        }
+        // Date → time-of-day / zone conversions (Rails returns TimeWithZone).
+        // `to_fs` / `to_formatted_s` / `after?` / `before?` stay unmodeled
+        // until runtime + lowering exist (invariant 6).
+        "to_time" | "beginning_of_day" | "end_of_day" | "midnight" | "at_midnight"
+        | "at_beginning_of_day" | "at_end_of_day" | "noon" | "at_noon" | "middle_of_day"
+        | "at_middle_of_day" if zero => time(),
+        "in_time_zone" if args.len() <= 1 && zone_arg(args.first()) => time(),
+        // `all_day` is a Time range (day edges); month/week/year stay Date.
+        "all_day" if zero => Ty::Class {
+            id: ClassId(Symbol::from("Range")),
+            args: vec![time()],
+        },
+        "all_week" | "all_month" | "all_year" if zero => Ty::Class {
+            id: ClassId(Symbol::from("Range")),
+            args: vec![date()],
+        },
+        "year" | "month" | "mon" | "day" | "mday" | "wday" | "yday" if zero => Ty::Int,
+        "<=>" if args.len() == 1 => Ty::Int,
         "iso8601" | "xmlschema" | "to_s" | "strftime" | "inspect" => Ty::Str,
-        "<" | ">" | "<=" | ">=" | "leap?" | "monday?" | "tuesday?" | "wednesday?"
-        | "thursday?" | "friday?" | "saturday?" | "sunday?" => Ty::Bool,
+        // `change` / `advance` / `between?` / `after?` / `before?` stay
+        // unmodeled until runtime + lowering exist (invariant 6).
+        "<" | ">" | "<=" | ">=" if args.len() == 1 => Ty::Bool,
+        "leap?"
+        | "past?" | "future?" | "today?" | "yesterday?" | "tomorrow?"
+        | "monday?" | "tuesday?" | "wednesday?" | "thursday?" | "friday?"
+        | "saturday?" | "sunday?" | "on_weekend?" | "on_weekday?"
+            if zero =>
+        {
+            Ty::Bool
+        }
         _ => return None,
     })
 }
@@ -2085,12 +2383,15 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
             Ty::Float => Ty::Float,
             _ => Ty::Untyped,
         },
-        "exclude?" => Ty::Bool,
+        "exclude?" | "intersect?" => Ty::Bool,
         // `Set` isn't parameterized, so the element type can't be carried.
         "to_set" => Ty::Class { id: ClassId(Symbol::from("Set")), args: vec![] },
         // JSON serialization of a collection is a String whatever the
         // elements are.
         "to_json" => Ty::Str,
+        // ActiveSupport `Array#as_json`: the JSON-primitive structure,
+        // an Array of whatever each element serializes to.
+        "as_json" => Ty::Array { elem: Box::new(Ty::Untyped) },
         "find" | "detect" => Ty::Union {
             variants: vec![elem.clone(), Ty::Nil],
         },
@@ -2206,13 +2507,6 @@ pub(super) fn hash_method(
 ) -> Ty {
     match method.as_str() {
         "[]" => Ty::Union { variants: vec![value.clone(), Ty::Nil] },
-        // Not `deep_*` on nested values: grounding is identity or one-level conversion, and nested hashes stay as they are.
-        "symbolize_keys" | "symbolize_keys!" | "deep_symbolize_keys" => {
-            Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(value.clone()) }
-        }
-        "stringify_keys" | "deep_stringify_keys" => {
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(value.clone()) }
-        }
         // `h[k] = v` returns the assigned value in Ruby, but here we
         // can't tell the argument's type from just the receiver's
         // generic Value — and the result is rarely chained. Return
@@ -2242,7 +2536,7 @@ pub(super) fn hash_method(
         },
         "length" | "size" | "count" => Ty::Int,
         "values" => Ty::Array { elem: Box::new(value.clone()) },
-        "empty?" | "any?" | "none?" | "key?" | "has_key?" | "include?" => Ty::Bool,
+        "empty?" | "any?" | "none?" | "all?" | "one?" | "key?" | "has_key?" | "include?" => Ty::Bool,
         "keys" => Ty::Array { elem: Box::new(key.clone()) },
         "key" => Ty::Union { variants: vec![key.clone(), Ty::Nil] },
         // `Hash#fetch(k, default)` answers `default` when the key is
@@ -2292,6 +2586,18 @@ pub(super) fn hash_method(
         "transform_values" | "transform_values!" => Ty::Hash {
             key: Box::new(key.clone()),
             value: Box::new(block_ret.cloned().unwrap_or_else(|| value.clone())),
+        },
+        // ActiveSupport key conversions: the same values under Symbol /
+        // String keys (`params.permit(:x).to_h.symbolize_keys`).
+        "symbolize_keys" | "deep_symbolize_keys" | "symbolize_keys!"
+        | "deep_symbolize_keys!" => Ty::Hash {
+            key: Box::new(Ty::Sym),
+            value: Box::new(value.clone()),
+        },
+        "stringify_keys" | "deep_stringify_keys" | "stringify_keys!"
+        | "deep_stringify_keys!" | "with_indifferent_access" => Ty::Hash {
+            key: Box::new(Ty::Str),
+            value: Box::new(value.clone()),
         },
         // `transform_keys { |k| ... }` → Hash[U, V].
         "transform_keys" | "transform_keys!" => Ty::Hash {
@@ -2368,10 +2674,34 @@ pub(super) fn hash_method(
             key: Box::new(key.clone()),
             value: Box::new(value.clone()),
         },
+        // ActiveSupport's Hash core_ext. The key-normalizing copies
+        // (`symbolize_keys`, `with_indifferent_access`, ...) and
+        // `to_query`/`to_param` are typed above; `to_xml` renders a
+        // document.
+        "to_xml" => Ty::Str,
+        // `first` without a count is the first `[key, value]` pair (nil
+        // when empty); with a count, an Array of pairs.
+        "first" => {
+            let pair = Ty::Tuple { elems: vec![key.clone(), value.clone()] };
+            if args.is_empty() {
+                Ty::Union { variants: vec![pair, Ty::Nil] }
+            } else {
+                Ty::Array { elem: Box::new(pair) }
+            }
+        }
+        // The first key that maps to a value, or nil.
+        "filter_map" => Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or_else(unknown)) },
+        // Strong-parameters `permit!` marks everything permitted.
+        "to_hash" => Ty::Hash {
+            key: Box::new(key.clone()),
+            value: Box::new(value.clone()),
+        },
         // JSON/string renderings of a Hash are Strings whatever the
         // value type — campfire's `Webhook#payload(message).to_json`
         // nests hashes three deep.
         "to_json" | "to_s" | "inspect" => Ty::Str,
+        // ActiveSupport `Hash#as_json`: string keys, JSON-primitive values.
+        "as_json" => Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
         _ => unknown(),
     }
 }
@@ -2430,7 +2760,7 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         "casecmp" => Ty::Int,
         // Bang forms answer nil when nothing changed, so the value is `String?`.
         "gsub!" | "sub!" | "strip!" | "lstrip!" | "rstrip!" | "chomp!" | "chop!" | "squeeze!"
-        | "downcase!" | "upcase!" | "capitalize!" | "tr!" | "delete!" => Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
+        | "downcase!" | "upcase!" | "capitalize!" | "slice!" | "tr!" | "delete!" | "squish!" => Ty::Union { variants: vec![Ty::Str, Ty::Nil] },
         "casecmp?" => Ty::Bool,
         // `ord` → the codepoint of the first character.
         "ord" => Ty::Int,
@@ -2443,7 +2773,24 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         "=~" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
         // `index`/`rindex` → the substring position or nil.
         "index" | "rindex" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
-        "chars" | "lines" | "split" | "bytes" | "scan" => Ty::Array { elem: Box::new(Ty::Str) },
+        "bytes" => Ty::Array { elem: Box::new(Ty::Int) },
+        "chars" | "lines" | "split" | "scan" | "each_char" => Ty::Array { elem: Box::new(Ty::Str) },
+        // `String#count(chars)` — how many of the given characters occur.
+        "count" => Ty::Int,
+        // `String#ascii_only?` and ActiveSupport's `exclude?` (the
+        // negation of `include?`).
+        "ascii_only?" | "exclude?" => Ty::Bool,
+        // `String#insert(index, str)` mutates and answers the receiver;
+        // `to_str` is the implicit-conversion spelling of itself;
+        // `encode` re-encodes; ActiveSupport's `first(n)` / `last(n)`
+        // are the leading / trailing slice.
+        "insert" | "to_str" | "encode" | "first" | "last" => Ty::Str,
+        // The in-place forms answer the receiver, or nil when nothing
+        // changed.
+        // `String#unpack` decodes into an Array of whatever the
+        // template names; `unpack1` its first element.
+        "unpack" => Ty::Array { elem: Box::new(Ty::Untyped) },
+        "unpack1" => Ty::Untyped,
         "empty?" | "blank?" | "present?" | "include?" | "start_with?"
         | "end_with?" | "match?" => Ty::Bool,
         // ActiveSupport `Object#presence_in(collection)` — the receiver
@@ -2484,6 +2831,9 @@ pub(super) fn str_method(method: &Symbol) -> Ty {
         | "squish" | "remove" | "indent" | "strip_heredoc"
         | "html_safe" | "to_query" | "to_param" => Ty::Str,
         "constantize" | "safe_constantize" => unknown(),
+        // JSON encoding is provided by the Ruby runtime; the other
+        // ActiveSupport conversions need their own shared implementations.
+        "to_json" => Ty::Str,
         // ActiveSupport boolean predicates (Object#blank? is universal
         // and lives there; String#starts_with? / ends_with? are
         // ActiveSupport's underscore-style aliases of start_with? /
@@ -2547,7 +2897,22 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         // ActiveSupport byte-size helpers — like the duration helpers,
         // they yield a Numeric-ish value we don't model structurally.
         "bytes" | "kilobytes" | "megabytes" | "gigabytes" | "terabytes"
-        | "petabytes" | "exabytes" => Ty::Untyped,
+        | "petabytes" | "exabytes" | "byte" | "kilobyte" | "megabyte"
+        | "gigabyte" | "terabyte" | "petabyte" | "exabyte" => Ty::Untyped,
+        // Integer's own protocol, which `Comparable`, `Numeric` and
+        // `Integer` give it and which the table above left out.
+        // `clamp` answers one of its bounds or the receiver: Integer for
+        // Integer bounds, the common shape (`page.clamp(1, 100)`).
+        "to_int" | "size" | "remainder" | "ceildiv" | "ord" | "magnitude" => Ty::Int,
+        "between?" | "integer?" | "finite?" | "infinite?" | "nan?" | "allbits?"
+        | "anybits?" | "nobits?" => Ty::Bool,
+        "digits" => Ty::Array { elem: Box::new(Ty::Int) },
+        "nonzero?" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
+        // `upto` / `downto` / `step` return the receiver with a block and
+        // an Enumerator without one; the two are not told apart here.
+        // `to_d` / `to_r` / `to_c` build BigDecimal / Rational / Complex,
+        // which the registry does not model.
+        "to_r" | "to_c" | "rationalize" | "coerce" => Ty::Untyped,
         // ActiveSupport Numeric duration helpers — `1.day`, `2.hours`,
         // `30.minutes`, etc. Each returns an ActiveSupport::Duration
         // instance; we don't model that structurally so propagate
@@ -2559,6 +2924,8 @@ pub(super) fn int_method(method: &Symbol) -> Ty {
         // `ago` / `from_now` / `since` / `until` produce a Time-ish
         // value; same propagation rationale.
         "ago" | "from_now" | "since" | "until" => Ty::Untyped,
+        // ActiveSupport `Numeric#in_time_zone` — epoch seconds → Time.
+        "in_time_zone" => Ty::Time,
         // Common Int formatters from ActiveSupport.
         "ordinalize" | "ordinal" => Ty::Str,
         _ => unknown(),
@@ -2692,6 +3059,86 @@ fn flatten_elem(t: &Ty) -> Ty {
     }
 }
 
+/// Ruby's own object protocol, answered for any receiver whose type
+/// table has no entry for `method`.
+///
+/// Every object is a `Kernel`/`Object` and every class is a `Module`,
+/// so the reflective surface (`instance_variable_get`,
+/// `define_singleton_method`, `singleton_class`, `extend`) and
+/// ActiveSupport's `Object` extensions (`in?`, `as_json`, `to_param`,
+/// `instance_values`) exist on an `Integer`, a `Symbol`, a rescued
+/// `StandardError` and an app model alike. The per-type tables model
+/// what a type adds; none of them repeats what all of them inherit, so
+/// a send that reaches the end of a table without a hit tries this one
+/// before it is called unknown. Consulted AFTER the receiver's own
+/// dispatch, so an app class that defines `send` or `in?` itself, or a
+/// table that types `Symbol#in?` more precisely, wins.
+pub(super) fn is_module_protocol(method: &Symbol) -> bool {
+    matches!(method.as_str(),
+        "define_method" | "alias_method" | "class_eval" | "class_exec" | "module_eval" | "module_exec"
+        | "instance_method" | "public_instance_method" | "const_get" | "constants"
+        | "class_variable_get" | "class_variable_set" | "class_variable_defined?"
+        | "method_defined?" | "public_method_defined?" | "private_method_defined?"
+        | "const_defined?" | "include?" | "instance_methods" | "public_instance_methods"
+        | "private_instance_methods" | "remove_method" | "undef_method")
+}
+
+pub(super) fn object_protocol_method(
+    recv_ty: Option<&Ty>,
+    method: &Symbol,
+    block_ret: Option<&Ty>,
+    class_object: bool,
+) -> Option<Ty> {
+    // `include?` doubles as Enumerable/String membership — answer Bool even
+    // without a proven Module receiver. Other Module-protocol names still
+    // require a class/module object.
+    if is_module_protocol(method) && !class_object && method.as_str() != "include?" {
+        return None;
+    }
+    let sym_list = || Ty::Array { elem: Box::new(Ty::Sym) };
+    let recv = || recv_ty.cloned().unwrap_or(Ty::Untyped);
+    let block = || block_ret.filter(|t| !matches!(t, Ty::Var { .. })).cloned().unwrap_or(Ty::Untyped);
+    Some(match method.as_str() {
+        // Kernel / Object reflection.
+        "instance_variable_get" | "instance_variable_set" | "method" | "instance_method"
+        | "public_instance_method" | "const_get" | "class_variable_get" | "class_variable_set"
+        | "enum_for" | "to_enum" => Ty::Untyped,
+        "instance_variable_defined?" | "in?" | "method_defined?"
+        | "public_method_defined?" | "private_method_defined?" | "const_defined?"
+        | "class_variable_defined?" | "include?" => Ty::Bool,
+        "instance_variables" | "methods" | "public_methods" | "private_methods"
+        | "protected_methods" | "singleton_methods" | "instance_methods"
+        | "public_instance_methods" | "private_instance_methods" | "constants" => sym_list(),
+        "define_singleton_method" | "define_method" | "alias_method" => Ty::Sym,
+        "singleton_class" => Ty::Class { id: ClassId(Symbol::from("Class")), args: vec![] },
+        "extend" | "remove_method" | "undef_method" | "dup" | "clone" => recv(),
+        "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval"
+        | "module_exec" => block(),
+        "display" => Ty::Nil,
+        // ActiveSupport's Object extensions. `to_param` on Untyped (and
+        // other non-nominal receivers) lowers to `ActiveSupport.to_param`
+        // (runtime exists). A nominal class without a synthesized/
+        // registered reader must hit the Object-extension refusal instead
+        // of being answered here (see critic_admission Value.new.to_param).
+        "to_json" | "to_yaml" => Ty::Str,
+        "to_param" if !matches!(recv_ty, Some(Ty::Class { .. })) => Ty::Str,
+        "===" | "!~" => Ty::Bool,
+        "<=>" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
+        _ => return None,
+    })
+}
+
+/// `ActionController::Parameters` read as the Hash it stands in for:
+/// Symbol keys over param values (`String | Array | Parameters`), so
+/// `params.fetch(:ids, [])`, `params.each { |k, v| }` and
+/// `params.values` hand out the same element union `params[:k]` does.
+pub(super) fn params_as_hash() -> Ty {
+    Ty::Hash {
+        key: Box::new(Ty::Sym),
+        value: Box::new(crate::analyze::registry::controllers::param_value_ty(false)),
+    }
+}
+
 /// The request-params value a nested read answers: a scalar, a hash or an array, whichever the request carried.
 pub(crate) const PARAM_VALUE: &str = "Roundhouse::ParamValue";
 
@@ -2711,7 +3158,8 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         | "!=" | "===" | "equal?" | "eql?" => Ty::Bool,
         "each" | "each_pair" | "each_value" | "each_key" | "each_with_index" | "reverse_each"
         | "select" | "filter" | "reject" | "compact" | "uniq" | "sort" | "sort_by" | "reverse"
-        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require" => pv(),
+        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require"
+        | "with_defaults" | "with_defaults!" | "reverse_merge" | "reverse_merge!" => pv(),
         "map" | "collect" | "flat_map" | "filter_map" => {
             Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or(Ty::Untyped)) }
         }
