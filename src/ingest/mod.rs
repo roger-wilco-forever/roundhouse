@@ -20,6 +20,7 @@ mod graphql_ruby;
 pub(crate) mod class_attribute;
 mod class_configuration;
 mod dry_struct;
+mod dry_types;
 pub mod allow_browser;
 pub mod app;
 mod concern_accessors;
