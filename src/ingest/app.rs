@@ -1707,6 +1707,9 @@ end
     // `Dry::Struct` classes become plain readers and a constructor,
     // before anything reads their methods.
     super::dry_struct::lower_dry_structs(&mut app, &sources);
+    // After the structs: an option typed with a struct builds the lowered one.
+    super::dry_initializer::lower_dry_initializers(&mut app, &sources);
+    super::dry_initializer::drop_unused_type_constants(&mut app, &sources);
     // graphql-ruby object types: analyzer-only field methods, so
     // inference carries each type's record class down the schema.
     super::graphql_ruby::lower_graphql_types(&mut app);

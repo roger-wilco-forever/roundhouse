@@ -14,6 +14,8 @@ mod integer_query_find_by;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
+#[path = "support/dry_initializer.rs"]
+mod dry_initializer;
 #[path = "support/dry_struct.rs"]
 mod dry_struct;
 #[path = "support/data_factory.rs"]
@@ -285,6 +287,33 @@ fn dry_struct_classes_run_lowered() {
     assert!(run.stdout.contains("dry-struct contract passed"));
     assert!(run.stdout.contains("dry-struct stamp contract passed"));
     assert!(run.stdout.contains("dry-struct clock contract passed"));
+}
+
+#[test]
+fn dry_initializer_classes_run_lowered() {
+    let run = dry_initializer::ruby_overlay().run_ruby(dry_initializer::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("dry-initializer contract passed"));
+}
+
+/// A class the lowering cannot read stays on the gem with its subclasses
+/// (ledgered); its parent and siblings are lowered regardless.
+#[test]
+fn dry_initializer_refusal_stops_at_the_refused_class() {
+    let (emitted, _errors) = dry_initializer::overlay()
+        .write(
+            "lib/svc/odd.rb",
+            "module Svc\n  class Odd < Base\n    option :size, ::Svc::Types::Strict::Integer.constrained(gt: 0)\n  end\n\n  class Odder < Odd\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let base = std::fs::read_to_string(emitted.join("app/models/svc/base.rb")).expect("emitted Svc::Base");
+    assert!(base.contains("def dry_initializer_assign"), "parent not lowered:\n{base}");
+    let quote = std::fs::read_to_string(emitted.join("app/models/svc/quote.rb")).expect("emitted Svc::Quote");
+    assert!(quote.contains("def dry_initializer_assign"), "sibling not lowered:\n{quote}");
+    for refused in ["svc/odd.rb", "svc/odder.rb"] {
+        let source = std::fs::read_to_string(emitted.join("app/models").join(refused)).expect(refused);
+        assert!(!source.contains("dry_initializer_assign"), "{refused} lowered:\n{source}");
+    }
 }
 
 /// Spinel's tree has its own `Date` and `BigDecimal()`, but no

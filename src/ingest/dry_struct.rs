@@ -43,7 +43,7 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
 use super::dry_types::{
-    BareNames, DryType, Gen, Scope, coerced, dry_type, holds_dry_type, resolve,
+    BareNames, DryType, Gen, Scope, coerced, dry_type, resolve,
     resolve_in, types_modules, types_path,
 };
 use super::{IngestError, survey};
@@ -210,12 +210,6 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
     // and its attribute calls would read as missing; the gem keeps it.
     if any && refused_roots.is_empty() {
         app.library_classes.extend(error_classes());
-        // Nothing left needs dry-types, and the `Types` modules are not
-        // emitted: a constant still building a type would fail the load.
-        for lc in &mut app.library_classes {
-            let holder = lc.name.0.as_str().to_string();
-            lc.constants.retain(|(_, value)| !holds_dry_type(value, &holder, &types_modules, &names));
-        }
     }
 }
 
