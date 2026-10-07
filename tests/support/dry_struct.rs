@@ -1,6 +1,9 @@
 //! `Dry::Struct` classes, lowered at ingest (`ingest::dry_struct`). One
 //! contract for the interpreted and native lanes.
 
+// Each lane uses only its part.
+#![allow(dead_code)]
+
 pub fn overlay() -> super::emit_and_run::Overlay {
     super::emit_and_run::real_blog()
         .write(
