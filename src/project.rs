@@ -1297,9 +1297,12 @@ fn report_dry_struct_stdlib(app: &App, target: BuildTarget) {
                 ExprNode::Const { path } if named(path) == ["Time"] => Some(("Time.parse", "Dry::Struct date coercion")),
                 _ => None,
             },
-            ExprNode::Send { method, .. } if method.as_str() == "interpret_loosely" => {
-                Some(("BigDecimal.interpret_loosely", "Dry::Struct decimal coercion"))
-            }
+            ExprNode::Send { recv: Some(recv), method, .. } if method.as_str() == "interpret_loosely" => match &*recv.node {
+                ExprNode::Const { path } if named(path) == ["BigDecimal"] => {
+                    Some(("BigDecimal.interpret_loosely", "Dry::Struct decimal coercion"))
+                }
+                _ => None,
+            },
             ExprNode::Send { recv: None, method, .. } if method.as_str() == "BigDecimal" && !spinel => {
                 Some(("BigDecimal()", "Dry::Struct decimal coercion"))
             }
@@ -1323,6 +1326,10 @@ fn report_dry_struct_stdlib(app: &App, target: BuildTarget) {
         if lc.origin == Some(crate::dialect::LibraryClassOrigin::DryStruct) {
             for method in &lc.methods {
                 visit(&method.body, target);
+            }
+            // Shared defaults are class constants, evaluated at load.
+            for (_, value) in &lc.constants {
+                visit(value, target);
             }
         }
     }

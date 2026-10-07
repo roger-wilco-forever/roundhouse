@@ -293,13 +293,34 @@ fn dry_struct_classes_run_lowered() {
 /// reached, and one using only the former is not.
 #[test]
 fn dry_struct_stdlib_coercions_are_reported_for_spinel() {
-    let (_emitted, errors) = dry_struct::overlay().emit(roundhouse::project::BuildTarget::Spinel);
+    let (emitted, errors) = dry_struct::overlay().emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.iter().all(|e| !e.contains("Dry::Struct")), "{errors:#?}");
+    // ... and the struct emitted with its date and decimal coercions.
+    let stamp = std::fs::read_to_string(emitted.join("app/models/shop/stamp.rb")).expect("emitted Shop::Stamp");
+    for coercion in ["::Date.parse(", "is_a?(::Date)", "BigDecimal("] {
+        assert!(stamp.contains(coercion), "{coercion} not emitted:\n{stamp}");
+    }
     let (_emitted, errors) = dry_struct::clock_overlay(dry_struct::overlay())
         .emit(roundhouse::project::BuildTarget::Spinel);
     for what in ["`DateTime`", "`Time.parse`", "`BigDecimal.interpret_loosely`"] {
         assert!(errors.iter().any(|e| e.contains(what)), "{what} not reported: {errors:#?}");
     }
+    // A shared default is a class constant, scanned like the methods.
+    let (_emitted, errors) = dry_struct::overlay()
+        .write(
+            "lib/shop/since.rb",
+            "module Shop\n  class Since < Dry::Struct\n    attribute? :at, ::Shop::Types::Any.default(Time.parse(\"2026-01-01\"))\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("`Time.parse`")), "default not scanned: {errors:#?}");
+    // An app's own `interpret_loosely` is not BigDecimal's.
+    let (_emitted, errors) = dry_struct::overlay()
+        .write(
+            "lib/shop/loose.rb",
+            "module Shop\n  class Loose < Dry::Struct\n    attribute :v, ::Shop::Types::Any.constructor { |v| v.interpret_loosely }\n  end\nend\n",
+        )
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().all(|e| !e.contains("interpret_loosely")), "{errors:#?}");
 }
 
 /// A struct the lowering cannot read keeps its whole `Dry::Struct`

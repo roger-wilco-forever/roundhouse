@@ -102,6 +102,10 @@ end
             "module Shop\n  class Stamp < Dry::Struct\n    attribute? :on, ::Shop::Types::Params::Date\n    attribute? :due, ::Shop::Types::Strict::Date\n    attribute? :price, ::Shop::Types::Coercible::Decimal\n  end\nend\n",
         )
         .write(
+            "lib/shop/counted.rb",
+            "module Shop\n  module Calls\n    def self.bump\n      @count = count + 1\n    end\n\n    def self.count\n      @count || 0\n    end\n  end\n\n  class Counted < Dry::Struct\n    attribute :pick, ::Shop::Types::String.constructor { |v|\n      ::Shop::Calls.bump\n      v.to_s\n    }.enum(\"a\", \"b\")\n  end\nend\n",
+        )
+        .write(
             "lib/shop/kinds.rb",
             "module Shop\n  module Kinds\n    PAYER = ::Shop::Types.Instance(::Shop::Money) | ::Shop::Types.Instance(::Shop::Refund)\n  end\nend\n",
         )
@@ -325,6 +329,14 @@ raise "constructor value" unless Shop::Tagged.new(a: 1, n: 4).n == 4
 begin
   Shop::Tagged.new(a: 1, n: :x)
   raise "next skipped the type check"
+rescue Dry::Struct::Error
+end
+before = Shop::Calls.count
+raise "enum" unless Shop::Counted.new(pick: :a).pick == "a"
+raise "enum coerced #{Shop::Calls.count - before} times" unless Shop::Calls.count - before == 1
+begin
+  Shop::Counted.new(pick: "z")
+  raise "enum accepted z"
 rescue Dry::Struct::Error
 end
 puts "dry-struct contract passed"

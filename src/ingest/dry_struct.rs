@@ -1033,6 +1033,8 @@ struct Gen {
     owner: String,
     constants: Vec<String>,
     helpers: Vec<String>,
+    /// Locals handed out so far; each holds one value, of one type.
+    temps: usize,
 }
 
 impl Gen {
@@ -1136,10 +1138,13 @@ fn coerced(extra: &mut Gen, ty: &DryType, value: &str, key: &str) -> String {
             format!("::{}.{name}({value})", extra.owner)
         }
     };
+    // The coerced value once, then checked and returned.
     let inner = match &ty.enumeration {
         Some(values) => {
             let list = values.iter().map(crate::emit::ruby::emit_expr).collect::<Vec<_>>().join(", ");
-            format!("[{list}].include?({inner}) ? {inner} : {fail}")
+            let temp = format!("dry_struct_enum_{}", extra.temps);
+            extra.temps += 1;
+            format!("({temp} = {inner}\n[{list}].include?({temp}) ? {temp} : {fail})")
         }
         None => inner,
     };
