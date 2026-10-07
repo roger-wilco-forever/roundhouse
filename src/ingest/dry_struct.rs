@@ -292,7 +292,8 @@ pub(super) fn lower_dry_structs(app: &mut App, sources: &[crate::span::SourceFil
         // Nothing left needs dry-types, and the `Types` modules are not
         // emitted: a constant still building a type would fail the load.
         for lc in &mut app.library_classes {
-            lc.constants.retain(|(_, value)| !holds_dry_type(value, &types_modules));
+            let holder = lc.name.0.as_str().to_string();
+            lc.constants.retain(|(_, value)| !holds_dry_type(value, &holder, &types_modules, &names));
         }
     }
 }
@@ -358,7 +359,7 @@ fn expand_nested(
                 [name] => (None, name),
                 [name, ty] => match &*ty.node {
                     ExprNode::Const { path }
-                        if types_path(path, types_modules)
+                        if types_path(path, &owner, types_modules, &existing)
                             .is_some_and(|rest| matches!(rest.as_slice(), [_, "Array"] | ["Array"])) =>
                     {
                         (Some(ty.clone()), name)
@@ -715,7 +716,7 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
     let plain = |base| Some(DryType { base, optional: false, default: None, enumeration: None, omittable: false });
     match &*expr.node {
         ExprNode::Const { path } => {
-            let Some(rest) = types_path(path, scope.types_modules) else {
+            let Some(rest) = types_path(path, scope.owner, scope.types_modules, scope.names) else {
                 // Another struct class, or a constant holding a type, as
                 // Ruby resolves the name here.
                 let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>();
@@ -812,7 +813,7 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
             }
             let then = if method.as_str() == "Constructor" {
                 let ExprNode::Const { path } = &*recv.node else { return None };
-                if !types_path(path, scope.types_modules)?.is_empty() || args.len() != 1 {
+                if !types_path(path, scope.owner, scope.types_modules, scope.names)?.is_empty() || args.len() != 1 {
                     return None;
                 }
                 DryType { base: Base::Nominal, optional: false, default: None, enumeration: None, omittable: false }
@@ -874,7 +875,7 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
                     return None;
                 };
                 let ExprNode::Const { path } = &*recv.node else { return None };
-                if !matches!(types_path(path, scope.types_modules)?.as_slice(), ["Strict" | "Nominal", "Hash"]) {
+                if !matches!(types_path(path, scope.owner, scope.types_modules, scope.names)?.as_slice(), ["Strict" | "Nominal", "Hash"]) {
                     return None;
                 }
                 let mut keys = Vec::new();
@@ -909,7 +910,7 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
             "of" => {
                 let [member] = args.as_slice() else { return None };
                 let ExprNode::Const { path } = &*recv.node else { return None };
-                let strict = match types_path(path, scope.types_modules)?.as_slice() {
+                let strict = match types_path(path, scope.owner, scope.types_modules, scope.names)?.as_slice() {
                     ["Nominal", "Array"] => false,
                     ["Strict", "Array"] => true,
                     _ => return None,
@@ -921,7 +922,7 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
             "Instance" => {
                 let [class] = args.as_slice() else { return None };
                 let ExprNode::Const { path } = &*recv.node else { return None };
-                if !types_path(path, scope.types_modules)?.is_empty() {
+                if !types_path(path, scope.owner, scope.types_modules, scope.names)?.is_empty() {
                     return None;
                 }
                 matches!(&*class.node, ExprNode::Const { .. })
@@ -935,19 +936,42 @@ fn dry_type(expr: &Expr, scope: &Scope<'_>) -> Option<DryType> {
 }
 
 /// The part of `path` after a `Types` module: `Coercible::String` from
-/// `::Randewoo::Types::Coercible::String`. The prefix must name a module
-/// that includes `Dry.Types()`, fully or by its last segments.
+/// `::Randewoo::Types::Coercible::String`. The `...::Types` prefix has to
+/// name a module that includes `Dry.Types()` as Ruby resolves it from
+/// `owner`: spelled from the top, exactly; otherwise in `owner`, then
+/// outward, and the first module found decides. An app's own
+/// `Billing::Types` is not dry-types because some other `Types` is.
 ///
 /// A bare name is given the namespace the module defaults it to:
 /// `Types::String` is `Strict::String` under `Dry.Types()`. `Any` is
 /// nominal whatever the default.
-fn types_path<'a>(path: &'a [Symbol], types_modules: &[(String, BareNames)]) -> Option<Vec<&'a str>> {
+fn types_path<'a>(
+    path: &'a [Symbol],
+    owner: &str,
+    types_modules: &[(String, BareNames)],
+    names: &HashSet<String>,
+) -> Option<Vec<&'a str>> {
+    let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
     let segments: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
     let at = segments.iter().rposition(|s| *s == "Types")?;
     let prefix = segments[..=at].join("::");
-    let (_, bare) = types_modules
-        .iter()
-        .find(|(m, _)| *m == prefix || m.ends_with(&format!("::{prefix}")))?;
+    let find = |full: &str| types_modules.iter().find(|(m, _)| m == full);
+    let (_, bare) = if absolute {
+        find(&prefix)?
+    } else {
+        let mut scope: Vec<&str> = owner.split("::").filter(|s| !s.is_empty()).collect();
+        loop {
+            let candidate =
+                if scope.is_empty() { prefix.clone() } else { format!("{}::{prefix}", scope.join("::")) };
+            if let Some(found) = find(&candidate) {
+                break found;
+            }
+            if names.contains(&candidate) || scope.is_empty() {
+                return None;
+            }
+            scope.pop();
+        }
+    };
     let rest = segments[at + 1..].to_vec();
     Some(match (rest.as_slice(), bare) {
         ([name], _) if *name == "Any" => rest,
@@ -979,10 +1003,16 @@ fn next_to_return(expr: &Expr) -> Expr {
 }
 
 /// Whether `expr` builds a dry type: it reads a `Types` module.
-fn holds_dry_type(expr: &Expr, types_modules: &[(String, BareNames)]) -> bool {
-    let own = matches!(&*expr.node, ExprNode::Const { path } if types_path(path, types_modules).is_some());
+fn holds_dry_type(
+    expr: &Expr,
+    holder: &str,
+    types_modules: &[(String, BareNames)],
+    names: &HashSet<String>,
+) -> bool {
+    let own = matches!(&*expr.node, ExprNode::Const { path }
+        if types_path(path, holder, types_modules, names).is_some());
     let mut found = own;
-    expr.node.for_each_child(&mut |c| found |= holds_dry_type(c, types_modules));
+    expr.node.for_each_child(&mut |c| found |= holds_dry_type(c, holder, types_modules, names));
     found
 }
 

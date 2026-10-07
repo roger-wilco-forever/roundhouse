@@ -105,6 +105,11 @@ end
             "lib/shop/counted.rb",
             "module Shop\n  module Calls\n    def self.bump\n      @count = count + 1\n    end\n\n    def self.count\n      @count || 0\n    end\n  end\n\n  class Counted < Dry::Struct\n    attribute :pick, ::Shop::Types::String.constructor { |v|\n      ::Shop::Calls.bump\n      v.to_s\n    }.enum(\"a\", \"b\")\n  end\nend\n",
         )
+        // An app's own `Types` module, which dry-types never sees.
+        .write(
+            "lib/billing.rb",
+            "module Billing\n  module Types\n    PLAN = \"gold\"\n  end\n\n  module Usage\n    CHOSEN = Types::PLAN\n  end\nend\n",
+        )
         .write(
             "lib/shop/kinds.rb",
             "module Shop\n  module Kinds\n    PAYER = ::Shop::Types.Instance(::Shop::Money) | ::Shop::Types.Instance(::Shop::Refund)\n  end\nend\n",
@@ -339,5 +344,6 @@ begin
   raise "enum accepted z"
 rescue Dry::Struct::Error
 end
+raise "an app's own Types constant was dropped" unless Billing::Usage::CHOSEN == "gold"
 puts "dry-struct contract passed"
 "#;
