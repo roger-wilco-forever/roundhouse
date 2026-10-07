@@ -413,6 +413,7 @@ fn expand_nested(
                 name: crate::ident::ClassId(Symbol::from(full.as_str())),
                 is_module: false,
                 parent: Some(crate::ident::ClassId(Symbol::from("Dry::Struct"))),
+                parent_span: crate::span::Span::synthetic(),
                 includes: Vec::new(),
                 methods: Vec::new(),
                 nullable_columns: Vec::new(),
