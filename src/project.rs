@@ -7608,7 +7608,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
     // every understood `stub_request` chain to the slot by the time this
     // scan runs, so on the ruby family the slot's delegate is what reaches
     // the gem — and that is the demand.
-    const TEST_GEMS: [(Marker, &str, &str); 4] = [
+    const TEST_GEMS: [(Marker, &str, &str); 5] = [
         (Marker::AnyText(&["WebMock.", "WebMock::", "HttpStub."]), "webmock", "webmock/minitest"),
         // `MochaBridge.` is the lowering's own spelling of a chain it hands
         // back to the gem (`lower::mocha`), and the paren-less forms are
@@ -7627,6 +7627,8 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         // only, so without this row the suite would reach a gem its
         // Gemfile never named.
         (Marker::Constant("Retryable"), "retryable", "retryable"),
+        // JWT, the same way: a suite that signs its own tokens.
+        (Marker::Constant("JWT"), "jwt", "jwt"),
     ];
 
     let mut needed: Vec<(&str, &str)> = Vec::new();
@@ -10646,6 +10648,24 @@ mod tests {
         assert!(gemfile.contains("\"retryable\""), "{gemfile}");
         let helper = &files.iter().find(|(p, _)| p == "test/test_helper.rb").unwrap().1;
         assert!(helper.contains("require \"retryable\""), "{helper}");
+    }
+
+    /// A test body that alone names JWT declares and requires it.
+    #[test]
+    fn a_test_body_naming_jwt_declares_the_gem() {
+        let mut files = vec![
+            ("test/test_helper.rb".to_string(), "require_relative \"../boot\"\n".to_string()),
+            (
+                "test/models/article_test.rb".to_string(),
+                "class ArticleTest < TestBase\n  def test_x\n    JWT.encode({ a: 1 }, \"k\", \"HS256\")\n  end\nend\n".to_string(),
+            ),
+            ("Gemfile".to_string(), "source \"https://rubygems.org\"\n".to_string()),
+        ];
+        apply_test_gem_wiring(&mut files);
+        let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
+        assert!(gemfile.contains("\"jwt\""), "{gemfile}");
+        let helper = &files.iter().find(|(p, _)| p == "test/test_helper.rb").unwrap().1;
+        assert!(helper.contains("require \"jwt\""), "{helper}");
     }
 
     /// `require "vips"` after boot. ruby-vips pulls in the system
