@@ -7608,7 +7608,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
     // every understood `stub_request` chain to the slot by the time this
     // scan runs, so on the ruby family the slot's delegate is what reaches
     // the gem — and that is the demand.
-    const TEST_GEMS: [(Marker, &str, &str); 3] = [
+    const TEST_GEMS: [(Marker, &str, &str); 4] = [
         (Marker::AnyText(&["WebMock.", "WebMock::", "HttpStub."]), "webmock", "webmock/minitest"),
         // `MochaBridge.` is the lowering's own spelling of a chain it hands
         // back to the gem (`lower::mocha`), and the paren-less forms are
@@ -7623,6 +7623,10 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         // dimensions, which is the only honest way to check that an
         // image endpoint served an image of the right size.
         (Marker::Constant("Vips"), "ruby-vips", "vips"),
+        // Retryable in a test body alone: `gems::RUNTIME_GEMS` reads app/
+        // only, so without this row the suite would reach a gem its
+        // Gemfile never named.
+        (Marker::Constant("Retryable"), "retryable", "retryable"),
     ];
 
     let mut needed: Vec<(&str, &str)> = Vec::new();
@@ -10624,6 +10628,24 @@ mod tests {
         apply_test_gem_wiring(&mut files);
         let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
         assert!(gemfile.contains("webmock"), "a test body's demand stands:\n{gemfile}");
+    }
+
+    /// A test body that alone names Retryable declares and requires it.
+    #[test]
+    fn a_test_body_naming_retryable_declares_the_gem() {
+        let mut files = vec![
+            ("test/test_helper.rb".to_string(), "require_relative \"../boot\"\n".to_string()),
+            (
+                "test/models/article_test.rb".to_string(),
+                "class ArticleTest < TestBase\n  def test_x\n    Retryable.retryable(tries: 2) { 1 }\n  end\nend\n".to_string(),
+            ),
+            ("Gemfile".to_string(), "source \"https://rubygems.org\"\n".to_string()),
+        ];
+        apply_test_gem_wiring(&mut files);
+        let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
+        assert!(gemfile.contains("\"retryable\""), "{gemfile}");
+        let helper = &files.iter().find(|(p, _)| p == "test/test_helper.rb").unwrap().1;
+        assert!(helper.contains("require \"retryable\""), "{helper}");
     }
 
     /// `require "vips"` after boot. ruby-vips pulls in the system
